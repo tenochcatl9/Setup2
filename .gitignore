@@ -43,6 +43,7 @@ generated/
 *.pid
 *.lock
 *.part
+consola
 
 # El respaldo comprimido del servidor SÍ se versiona a propósito
 # (es la forma de importar el mundo en otro equipo/máquina)

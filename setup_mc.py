@@ -1023,7 +1023,8 @@ def _leer_consola(proc) -> None:
     """
     while proc.poll() is None:
         try:
-            listos, _, _ = select.select([sys.stdin], [], [], 0)
+            # Timeout 0.1: espera activa pequeña en lugar de un bucle que quema CPU.
+            listos, _, _ = select.select([sys.stdin], [], [], 0.1)
         except (OSError, ValueError):
             return  # sin terminal (p. ej. entrada desde un fichero): nada que hacer
         if not listos:
@@ -1367,11 +1368,18 @@ fd = int(sys.argv[1])
 fifo = sys.argv[2]
 while True:
     try:
-        with open(fifo, "r") as f:
-            for linea in f:
-                linea = linea.strip()
-                if linea:
-                    os.write(fd, (linea + "\\n").encode())
+        f = open(fifo, "r")
+    except Exception:
+        continue
+    try:
+        for linea in f:
+            linea = linea.strip()
+            if linea:
+                os.write(fd, (linea + "\\n").encode())
+    except Exception:
+        pass
+    try:
+        f.close()
     except Exception:
         pass
 """
@@ -1391,23 +1399,29 @@ def asegurar_fifo_consola() -> bool:
         return False
 
 
-def _lanzar_puente_consola(proc) -> None:
+def _lanzar_puente_consola(proc) -> bool:
     """Proceso ayudante que lee el FIFO y lo vuelca en el stdin del servidor.
 
-    Necesita close_fds=False para heredar el extremo de escritura del pipe:
-    así, aunque este script termine, el servidor no se queda sin stdin.
+    pass_fds es imprescindible: con close_fds=False el ayudante NO hereda el
+    extremo de escritura del pipe (se queda solo con 0,1,2) y las escrituras
+    fallan en silencio. Así, aunque este script termine, el servidor conserva
+    su stdin y el canal de comandos sigue vivo.
     """
-    if proc.stdin is None or not asegurar_fifo_consola():
-        return
+    if proc.stdin is None:
+        return False
+    fd = proc.stdin.fileno()
+    if not asegurar_fifo_consola():
+        return False
     try:
         subprocess.Popen(
-            [sys.executable, "-c", CODIGO_PUENTE_CONSOLA,
-             str(proc.stdin.fileno()), str(FIFO_CONSOLA)],
+            [sys.executable, "-c", CODIGO_PUENTE_CONSOLA, str(fd), str(FIFO_CONSOLA)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            close_fds=False, start_new_session=True,
+            pass_fds=(fd,), start_new_session=True,
         )
+        return True
     except OSError as e:
         aviso(f"No se pudo abrir el canal de comandos: {e}")
+        return False
 
 
 def arrancar_servidor_detached(puerto: int):
