@@ -1099,13 +1099,14 @@ def arrancar_servidor(puerto: int):
         raise RuntimeError("No se encontró 'java' en el PATH.")
     cola: queue.Queue = queue.Queue()
     threading.Thread(target=_bombeo_salida, args=(proc, cola), daemon=True).start()
+    PID_SERVIDOR.write_text(f"{proc.pid}\n")
     # El puente del FIFO y el hilo de respaldos automáticos hacen falta aquí
     # también: este es el camino normal (servidor ya existente), no solo el de
     # la instalación inicial. Sin el puente, el respaldo automático no puede
     # congelar el mundo con save-off.
     _lanzar_puente_consola(proc)
     if not args_sin_backup_auto():
-        if arrancar_backups_auto():
+        if arrancar_backups_auto(puerto=puerto):
             log(f"Respaldo automático cada {BACKUP_AUTO_MINUTOS} min en "
                 f"respaldo/auto/ (se guardan los {BACKUP_AUTO_MANTENER} últimos).")
     return proc, cola
@@ -2140,7 +2141,7 @@ def arrancar_servidor_detached(puerto: int):
     PID_SERVIDOR.write_text(f"{proc.pid}\n")
     _lanzar_puente_consola(proc)
     if not args_sin_backup_auto():
-        arrancar_backups_auto()
+        arrancar_backups_auto(puerto=puerto)
     return proc
 
 
@@ -2507,7 +2508,7 @@ def _purgar_backups_auto() -> None:
             pass
 
 
-def respaldo_automatico() -> bool:
+def respaldo_automatico(puerto: int = 25565) -> bool:
     """Empaqueta el mundo SIN parar el servidor.
 
     Congela las escrituras (save-off + save-all flush), empaqueta, y siempre
@@ -2521,7 +2522,7 @@ def respaldo_automatico() -> bool:
     # servidor seguiría sin guardar y los jugadores perderían progreso.
     watchdog = None
     try:
-        if _vivo(_leer_pid(PID_SERVIDOR)) and _consola("save-off"):
+        if puerto_abierto(puerto) and _consola("save-off"):
             _consola("save-all flush")
             congelado = True
 
@@ -2535,6 +2536,12 @@ def respaldo_automatico() -> bool:
         incluir = [q for q in BACKUP_INCLUYE if q != "server.jar"]
         archivos, hash_contenido = _hash_contenido(SERVER_DIR, incluir)
         destino = DIR_BACKUP_AUTO / f"mundo-{time.strftime('%Y%m%d-%H%M%S')}.tar.zst"
+        # El tamaño comprimido solo se sabe al final; con el del respaldo
+        # anterior la barra advances con un porcentaje real en vez de girar sin
+        # número. Un margen del 2% evita que se pase del 100 antes de tiempo.
+        previos = sorted(DIR_BACKUP_AUTO.glob("mundo-*.tar.zst"),
+                         key=lambda x: x.name, reverse=True)
+        estimado = int(previos[0].stat().st_size * 1.02) if previos else None
         manifiesto = {
             "creado": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "paper": _version_paper() or "desconocida",
@@ -2544,7 +2551,7 @@ def respaldo_automatico() -> bool:
             "contenido_sha256": hash_contenido,
             "archivos": archivos,
         }
-        _empaquetar(destino, manifiesto, incluir)
+        _empaquetar(destino, manifiesto, incluir, total_esperado=estimado)
         miembros = _miembros_de_respaldo(destino)
         if MANIFIESTO not in miembros or not any(m.startswith("world/") for m in miembros):
             destino.unlink(missing_ok=True)
@@ -2569,29 +2576,44 @@ def respaldo_automatico() -> bool:
             _consola("save-on")
 
 
-def _bucle_backups_auto(intervalo_min: int) -> None:
+def _bucle_backups_auto(intervalo_min: int, puerto: int) -> None:
     while True:
         time.sleep(intervalo_min * 60)
         try:
-            if _vivo(_leer_pid(PID_SERVIDOR)):
-                respaldo_automatico()
-        except Exception:  # noqa: BLE001
-            pass          # el respaldo automático nunca debe tumbar el script
+            # Se pregunta por el puerto y no por el fichero de PID: en el
+            # camino interactivo ese fichero no se escribía y el hilo se
+            # saltaba todas las copias sin avisar.
+            if puerto_abierto(puerto):
+                respaldo_automatico(puerto)
+            else:
+                log("Se pasó el respaldo automático: el servidor no "
+                    "escucha en el puerto.")
+        except Exception as e:  # noqa: BLE001
+            # Ni una excepción debe tumbar el script, pero sí hay que
+            # enterarse: antes se silenciaban y no se veía ningún fallo.
+            error(f"Fallo inesperado en el respaldo automático: {e}")
 
 
-def arrancar_backups_auto(intervalo_min: int = BACKUP_AUTO_MINUTOS) -> bool:
+def arrancar_backups_auto(intervalo_min: int = BACKUP_AUTO_MINUTOS,
+                          puerto: int = 25565) -> bool:
     """Lanza el hilo del respaldo automático (una sola vez)."""
     global _HILO_BACKUPS
     if _HILO_BACKUPS is not None and _HILO_BACKUPS.is_alive():
         return False
     _HILO_BACKUPS = threading.Thread(target=_bucle_backups_auto,
-                                     args=(intervalo_min,), daemon=True,
+                                     args=(intervalo_min, puerto), daemon=True,
                                      name="respaldo-automatico")
     _HILO_BACKUPS.start()
     return True
 
-def _empaquetar(destino: Path, manifiesto: dict, incluir: list) -> tuple:
-    """Escribe el tar comprimido con el manifiesto dentro. Devuelve (bytes, segundos)."""
+def _empaquetar(destino: Path, manifiesto: dict, incluir: list,
+                total_esperado: int | None = None) -> tuple:
+    """Escribe el tar comprimido con el manifiesto dentro. Devuelve (bytes, segundos).
+
+    `total_esperado` no es obligatorio, pero sirve para que la barra muestre un
+    porcentaje real: el tamaño comprimido solo se conoce al terminar, así que
+    se estima a partir del respaldo anterior.
+    """
     compresor, _ = _compresor()
     destino.parent.mkdir(parents=True, exist_ok=True)
     temporal = destino.with_suffix(destino.suffix + ".part")
@@ -2609,7 +2631,7 @@ def _empaquetar(destino: Path, manifiesto: dict, incluir: list) -> tuple:
         # se llenaría y se quedaría bloqueado esperándonos.
         with tempfile.TemporaryFile() as errf, open(temporal, "wb") as f:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
-            barra = Barra(f"Comprimiendo {destino.name}", total=None)
+            barra = Barra(f"Comprimiendo {destino.name}", total=total_esperado)
             inicio = time.time()
             total = 0
             while True:
