@@ -1,0 +1,50 @@
+# >>> INICIO bloque gestionado por setup_mc.py >>>
+# Secretos: nunca deben llegar a un commit
+.env
+.env.*
+!.env.example
+
+# Servidor de Minecraft (vive en la raíz del proyecto)
+*.jar
+server.jar
+eula.txt
+server.properties
+bukkit.yml
+spigot.yml
+commands.yml
+paper-*.yml
+config/
+.paper/
+ops.json
+whitelist.json
+banned-players.json
+banned-ips.json
+banned-cache.json
+usercache.json
+world/
+world_nether/
+world_the_end/
+logs/
+plugins/
+libraries/
+cache/
+versions/
+crash-reports/
+generated/
+*.log
+*.pid
+*.lock
+*.part
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Editores y sistema operativo
+.vscode/
+.idea/
+.DS_Store
+# <<< FIN bloque gestionado por setup_mc.py <<<
