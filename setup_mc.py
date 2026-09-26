@@ -1183,12 +1183,26 @@ def _preguntar(texto: str) -> str:
 
 
 # ── Proveedor: Asyx ────────────────────────────────────────────────────────
-def asyx_esta_alto() -> bool:
-    """True si ya se hizo el alta (certificados en ~/.asyx)."""
+def asyx_estado_alta() -> str:
+    """Estado del alta de Asyx: 'completa', 'incompleta' o 'sin_alta'.
+
+    No basta con que ~/.asyx exista: una alta a medias deja device.json y el
+    CSR, pero Asyx exige el manifest.json que entrega al completar el registro.
+    """
     base = Path.home() / ".asyx"
     if not base.is_dir():
-        return False
-    return any(base.iterdir())
+        return "sin_alta"
+    manifest = list((base / "certs").glob("*/manifest.json")) if (base / "certs").is_dir() else []
+    if manifest:
+        return "completa"
+    if any(base.iterdir()):
+        return "incompleta"
+    return "sin_alta"
+
+
+def asyx_esta_alto() -> bool:
+    """True solo si el alta está realmente completa."""
+    return asyx_estado_alta() == "completa"
 
 
 def asyx_preparar() -> bool:
@@ -1200,7 +1214,19 @@ def asyx_preparar() -> bool:
     if asyx_esta_alto():
         log("Asyx ya está dado de alta (~/.asyx).")
         return True
-    titulo("ASYX NECESITA UNA CUENTA (solo esta vez)")
+    if asyx_estado_alta() == "incompleta":
+        titulo("EL ALTA DE ASYX QUEDÓ A MEDIAS")
+        error("Falta el manifest.json que Asyx entrega al completar el registro.")
+        log("    Se ve así: existe ~/.asyx/device.json y la clave, pero no hay")
+        log("    ningún manifest.json en ~/.asyx/certs/*/ . Con el alta a medias el")
+        log("    túnel no arranca (error 'missing manifest').")
+        print()
+        log("    Solución: repite el alta. Elimina lo que quedó a medias y vuelve")
+        log("    a empezar el registro:")
+        log("        rm -rf ~/.asyx && npx -y asyx@latest setup")
+        print()
+    else:
+        titulo("ASYX NECESITA UNA CUENTA (solo esta vez)")
     print(f"  1) Crea una cuenta gratuita en:  {ASYX_REGISTRO}")
     print("     (solo email, sin tarjeta)")
     print("  2) Vuelve aquí y ejecuta el alta, que abre el navegador para")
@@ -1218,7 +1244,7 @@ def asyx_preparar() -> bool:
     if asyx_esta_alto():
         ok("Asyx dado de alta.")
         return True
-    aviso("Asyx sigue sin alta: se usará Pinggy como respaldo.")
+    aviso("Asyx no está operativo: se usará Pinggy como respaldo.")
     return False
 
 
@@ -1226,8 +1252,12 @@ def asyx_prechequear() -> tuple:
     """(ok, motivo). Sin red que comprobar: lo decisivo es el alta local."""
     if asyx_esta_alto():
         return True, ""
-    return False, ("no tienes cuenta de Asyx (falta el alta). Créala en "
-                   f"{ASYX_REGISTRO} y ejecuta: npx -y asyx@latest setup")
+    estado = asyx_estado_alta()
+    if estado == "incompleta":
+        return False, ("el alta de Asyx está incompleta (falta el manifest.json). "
+                       "Arréglalo con:  rm -rf ~/.asyx && npx -y asyx@latest setup")
+    return False, ("no tienes cuenta de Asyx. Créala en " + ASYX_REGISTRO +
+                   " y ejecuta: npx -y asyx@latest setup")
 
 
 def asyx_comando(puerto: int) -> list:
@@ -1495,8 +1525,12 @@ def diagnostico_tunel() -> int:
         print()
         log(f"--- {prov['nombre']} ---")
         if clave == "asyx":
-            if asyx_esta_alto():
+            estado = asyx_estado_alta()
+            if estado == "completa":
                 ok("Cuenta creada y lista para usar (~/.asyx).")
+            elif estado == "incompleta":
+                error("Alta incompleta: falta ~/.asyx/certs/*/manifest.json.")
+                aviso("Se arregla con:  rm -rf ~/.asyx && npx -y asyx@latest setup")
             elif _comando_existe("node") and _comando_existe("npx"):
                 aviso("Sin alta todavía: crea la cuenta en " + ASYX_REGISTRO +
                       " y ejecuta  npx -y asyx@latest setup")
