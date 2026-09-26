@@ -1719,13 +1719,29 @@ def detener_tunel(proc):
 
 
 # ─── 11. Apertura y verificación del túnel ────────────────────────────────
-def _listo_para_verificar(host_puerto: str) -> bool:
-    """Comprueba que la dirección pública realmente acepta conexiones."""
+def _listo_para_verificar(host_puerto: str, intentos: int = 8, espera: float = 2.0) -> bool:
+    """Comprueba que la dirección pública acepta conexiones, con reintentos.
+
+    Importante: al abrirse el túnel, el puerto público tarda unos segundos en
+    estar disponible y el primer intento suele recibir un 'connection refused'
+    aunque el túnel vaya bien. Con un solo intento se descartaba un túnel
+    perfectamente bueno y se pasaba al proveedor de respaldo, así que se reintenta
+    durante unos segundos antes de darlo por malo.
+    """
     if ":" in host_puerto:
         host, _, puerto = host_puerto.rpartition(":")
     else:
         host, puerto = host_puerto, str(PUERTO_TUNEL)
-    return comprobar_tunel(host, int(puerto))
+    puerto = int(puerto)
+    for intento in range(1, intentos + 1):
+        if comprobar_tunel(host, puerto):
+            if intento > 1:
+                log(f"El puerto público respondió al reintento {intento} "
+                    f"({(intento - 1) * espera:.0f}s de propagación).")
+            return True
+        if intento < intentos:
+            time.sleep(espera)
+    return False
 
 
 def abrir_tunel(puerto: int, notificador=None, modo: str = "auto",
