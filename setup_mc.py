@@ -2009,7 +2009,8 @@ def modo_notificacion(args) -> int:
                 "chore: modo --solo-notificar (servidor y túnel en segundo plano)",
                 rama=args.rama,
                 con_respaldo=not args.sin_respaldo,
-                con_jar=not args.respaldo_sin_jar):
+                con_jar=not args.respaldo_sin_jar,
+                forzar_respaldo=args.forzar_respaldo):
             codigo = 1
     return codigo
 # ─── 13. Respaldo comprimido e importación ───────────────────────────────
@@ -2022,7 +2023,88 @@ BACKUP_EXCLUYE = [".env", ".env.*", ".git", "*.pid", "*.log", "*.part", "consola
                   "libraries", "cache", "respaldo", "__pycache__"]
 TAMANO_ADVERTENCIA = 50 * 1024 * 1024
 TAMANO_MAXIMO = 100 * 1024 * 1024
+# Techo del repositorio: cada copia del respaldo queda en el historial para
+# siempre, así que sin un límite .git crece ~70 MB en cada ejecución.
+GIT_AVISO = 600 * 1024 * 1024
+GIT_TECHO = 1024 * 1024 * 1024
+ESTADO_RESPALDO = Path.home() / ".local" / "state" / "setup_mc" / "respaldo.json"
 RESPALDO_ACTUAL: Path | None = None
+
+
+def _tamano_git() -> int:
+    """Tamaño total de .git en bytes (0 si no es un repo)."""
+    raiz = BASE_DIR / ".git"
+    if not raiz.is_dir():
+        return 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(raiz):
+        for nombre in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, nombre)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _mb(bytes_: int) -> str:
+    return f"{bytes_ / 1048576:,.0f} MB"
+
+
+def decidir_jar_del_respaldo(con_jar: bool) -> tuple:
+    """Decide si el respaldo incluye server.jar según el tamaño de .git.
+
+    Devuelve (incluir_jar, motivo). El server.jar son ~62 MB del paquete y es
+    lo único que infla el historial, así que en cuanto el repositorio se
+    acerca al techo se pasa automáticamente al respaldo pequeño (~7 MB).
+    """
+    if not con_jar:
+        return False, "pedido explícitamente con --respaldo-sin-jar"
+    tam = _tamano_git()
+    if tam == 0:
+        return True, ""
+    if tam >= GIT_TECHO:
+        aviso(f".git ocupa {_mb(tam)} y el techo es {_mb(GIT_TECHO)}.")
+        log("    No se vuelve a subir el respaldo: el repositorio se saturaría.")
+        log("    Para desbloquearlo, quita blobs antiguos del historial (git filter-repo")
+        log("    / BFG) o vuelve a empezar el repo; o usa --sin-respaldo mientras tanto.")
+        return False, f".git ya está en el techo ({_mb(tam)})"
+    if tam >= GIT_AVISO:
+        aviso(f".git ocupa {_mb(tam)}: se hace el respaldo SIN server.jar "
+              f"({_mb(TAMANO_MAXIMO // 10)}) para no engordarlo más.")
+        log(f"    Se avisa a partir de {_mb(GIT_AVISO)} y se bloquea a "
+            f"{_mb(GIT_TECHO)}. GitHub empieza a frenar pushes sobre 1 GB.")
+        return False, f".git grande ({_mb(tam)})"
+    return True, ""
+
+
+def _leer_estado_respaldo() -> dict:
+    try:
+        return json.loads(ESTADO_RESPALDO.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _guardar_estado_respaldo(hash_contenido: str):
+    try:
+        ESTADO_RESPALDO.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO_RESPALDO.write_text(json.dumps({
+            "contenido_sha256": hash_contenido,
+            "cuando": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "version": "servidor-mc.tar.zst",
+        }, indent=2))
+    except OSError:
+        pass
+
+
+def _respaldo_sigue_vigente(hash_contenido: str) -> bool:
+    """True si el respaldo ya versionado contiene exactamente este contenido.
+
+    Evita volver a subir ~70 MB idénticos cuando el mundo no ha cambiado.
+    """
+    if _leer_estado_respaldo().get("contenido_sha256") != hash_contenido:
+        return False
+    rel = _relativo(_paquete_respaldo())
+    return _git(["ls-files", "--error-unmatch", rel]).returncode == 0
 
 RE_RAW = re.compile(r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(.+)$", re.I)
 RE_REPO = re.compile(r"^([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
@@ -2188,15 +2270,29 @@ def _empaquetar(destino: Path, manifiesto: dict, incluir: list) -> tuple:
     return total, time.time() - inicio
 
 
-def crear_respaldo(con_jar: bool = True) -> bool:
-    """Empaqueta el servidor en respaldo/servidor-mc.tar.zst y valida el contenido."""
+def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
+    """Empaqueta el servidor en respaldo/servidor-mc.tar.zst y valida el contenido.
+
+    Se salta si el mundo no ha cambiado desde el último respaldo ya versionado:
+    volver a subirlo añadiría ~70 MB idénticos al historial sin aportar nada.
+    """
     global RESPALDO_ACTUAL
     if not (SERVER_DIR / "world").is_dir():
         aviso("No hay mundo guardado: se omite el respaldo.")
         return False
+    con_jar, motivo_jar = decidir_jar_del_respaldo(con_jar)
     incluir = [p for p in BACKUP_INCLUYE if con_jar or p != "server.jar"]
     archivos, hash_contenido = _hash_contenido(SERVER_DIR, incluir)
+    if motivo_jar and not con_jar:
+        log(f"    Motivo: {motivo_jar}.")
     RESPALDO_ACTUAL = _paquete_respaldo()
+    if not forzar and _respaldo_sigue_vigente(hash_contenido):
+        ok("El mundo no ha cambiado: se conserva el respaldo ya subido "
+           "(no se suman ~70 MB al repositorio).")
+        if not RESPALDO_ACTUAL.is_file():
+            aviso("Se regenerará en la próxima ejecución que cambie algo.")
+            return False
+        return True
     manifiesto = {
         "creado": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "paper": _version_paper() or "desconocida",
@@ -2432,7 +2528,7 @@ def preguntar_url_respaldo() -> str:
 
 # ─── 14. Commit y push a la rama principal ───────────────────────────────
 def subir_cambios(mensaje: str, rama: str = "main", con_respaldo: bool = True,
-                  con_jar: bool = True) -> bool:
+                  con_jar: bool = True, forzar_respaldo: bool = False) -> bool:
     """Verifica secretos, crea el respaldo, hace commit y empuja a la rama principal."""
     if not es_repo_git():
         aviso("No es un repositorio Git: no se puede subir nada.")
@@ -2444,7 +2540,7 @@ def subir_cambios(mensaje: str, rama: str = "main", con_respaldo: bool = True,
         return False
 
     if con_respaldo:
-        if not crear_respaldo(con_jar=con_jar):
+        if not crear_respaldo(con_jar=con_jar, forzar=forzar_respaldo):
             return False
 
     _git(["add", "-A"])
@@ -2484,6 +2580,11 @@ def subir_cambios(mensaje: str, rama: str = "main", con_respaldo: bool = True,
                   f"git push origin HEAD:{rama}")
         return False
     ok(f"Cambios subidos a origin/{rama} ({hash_commit}).")
+    tam = _tamano_git()
+    if tam:
+        nivel = "AVISO" if tam >= GIT_AVISO else "OK"
+        log(f"[{nivel}] Tamaño de .git tras el commit: {_mb(tam)} "
+            f"(aviso desde {_mb(GIT_AVISO)}, techo {_mb(GIT_TECHO)}).")
     return True
 
 
@@ -2509,7 +2610,9 @@ def parse_args():
     p.add_argument("--sin-respaldo", action="store_true",
                    help="No comprimir el servidor antes de subirlo")
     p.add_argument("--respaldo-sin-jar", action="store_true",
-                   help="Respaldo sin server.jar (~7 MB en vez de ~68 MB)")
+                   help="Respaldo sin server.jar (~7 MB en vez de ~70 MB)")
+    p.add_argument("--forzar-respaldo", action="store_true",
+                   help="Reempaquetar aunque el mundo no haya cambiado")
     p.add_argument("--solo-notificar", action="store_true",
                    help="Deja servidor y túnel en segundo plano, avisa a Discord y sube a Git")
     p.add_argument("--sin-notificar-tunel", action="store_true",
@@ -2703,6 +2806,7 @@ def main():
                 rama=args.rama,
                 con_respaldo=not args.sin_respaldo,
                 con_jar=not args.respaldo_sin_jar,
+                forzar_respaldo=args.forzar_respaldo,
             )
         else:
             aviso("El setup no llegó a completarse: no se sube nada a Git para no dejar basura.")
