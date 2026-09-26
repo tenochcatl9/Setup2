@@ -2451,11 +2451,22 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
               f"se forzará su subida.")
     tam = RESPALDO_ACTUAL.stat().st_size
     if tam > TAMANO_ADVERTENCIA:
-        aviso(f"El respaldo pesa {tam / 1048576:,.0f} MB. GitHub avisa a partir de 50 MB y "
-              f"no acepta archivos de más de 100 MB: usa --respaldo-sin-jar "
-              f"para que pese ~7 MB.")
+        aviso(f"El respaldo pesa {tam / 1048576:,.0f} MB. GitHub avisa a partir de "
+              f"{TAMANO_ADVERTENCIA // 1048576} MB; por encima de "
+              f"{TAMANO_MAXIMO // 1048576} MB ya no se puede subir.")
     if tam > TAMANO_MAXIMO:
-        aviso(f"Supera los {TAMANO_MAXIMO // 1048576} MB: GitHub rechazará el push.")
+        # El mundo en sí ya no cabe en git aunque se quite server.jar.
+        RESPALDO_ACTUAL.unlink(missing_ok=True)
+        error(f"El respaldo llega a {tam / 1048576:,.0f} MB incluso sin server.jar "
+              f"y GitHub no acepta archivos de más de {TAMANO_MAXIMO // 1048576} MB: "
+              "no se sube nada.")
+        log("    El mundo ha crecido demasiado para vivir en el repositorio. Opciones:")
+        log("      - respaldar el mundo aparte (Drive, Backblaze, S3) y dejar aquí")
+        log("        solo plugins/ y config/;")
+        log("      - publicar el tarball como release de GitHub y compartir el enlace")
+        log("        (el import ya acepta una URL directa);")
+        log("      - seguir sin respaldar con --sin-respaldo mientras tanto.")
+        return False
     ok(f"Respaldo listo: {_relativo(RESPALDO_ACTUAL)} "
        f"(MC {manifiesto['minecraft']}, {archivos} archivos, "
        f"{'con' if con_jar else 'sin'} server.jar)")
