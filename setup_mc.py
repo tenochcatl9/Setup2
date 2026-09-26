@@ -992,7 +992,9 @@ def iniciar_tunel_detached(puerto: int, timeout: int = TIMEOUT_TUNEL) -> tuple:
             barra.refrescar()
             time.sleep(0.2)
         barra.finalizar()
-        error(f"No se obtuvo la URL de QuickTunnel en {timeout} segundos.")
+        error(f"No se obtuvo la URL de QuickTunnel en {timeout} segundos.\n"
+              f"    Suele ser el firewall: QuickTunnel necesita salida TCP al puerto 22 "
+              f"de {QUICKTUNNEL_HOST}. Prübalo con:  nc -vz {QUICKTUNNEL_HOST} 22")
         _matar_pid(proc.pid)
         _limpiar_pid(PID_TUNEL)
         return "", None
