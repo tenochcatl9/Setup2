@@ -647,11 +647,43 @@ def actualizar_skinsrestorer() -> str:
 CONFIG_AUTHME = PLUGINS_DIR / "AuthMe" / "config.yml"
 
 
+# Ajustes de AuthMe que el script impone. Con túnel, el servidor ve una única
+# IP pública para todos los jugadores, así que cualquier límite por IP los
+# confunde entre sí: se rechazan registros o se les acusa de multicuenta.
+AJUSTES_AUTHME = {
+    # Sin esto solo se puede registrar UNA cuenta desde la IP del túnel: el
+    # segundo amigo que entra es rechazado directamente.
+    "maxRegPerIp": "0",
+    # Sin esto, al entrar se les muestra "Eres propietario de N cuentas",
+    # juntando las cuentas de todos los que entran por el túnel.
+    "displayOtherAccounts": "false",
+    # Se dejan explícitos aunque ya vengan a 0, por si el plugin los cambia.
+    "maxJoinPerIp": "0",
+    "maxLoginPerIp": "0",
+}
+
+
+def _ajustar_yaml(clave: str, valor: str) -> bool:
+    """Pone una clave YAML al valor pedido (edición por líneas, sin perder
+    los comentarios). Devuelve True si cambió algo."""
+    lineas = CONFIG_AUTHME.read_text().splitlines(keepends=True)
+    patron = re.compile(rf"^(\s*){re.escape(clave)}:\s*(\S.*)$")
+    for i, linea in enumerate(lineas):
+        m = patron.match(linea.rstrip("\n"))
+        if m and m.group(2).strip() != valor:
+            lineas[i] = f"{m.group(1)}{clave}: {valor}\n"
+            CONFIG_AUTHME.write_text("".join(lineas))
+            return True
+    return False
+
+
 def configurar_authme() -> bool:
     """Desactiva la base GeoIP de AuthMe (hace falta clave MaxMind de pago).
 
     Sin esto, AuthMe intenta descargarla en cada arranque y llena el log de
-    avisos. Se edita por líneas para no perder los comentarios del YAML.
+    avisos. Además relaja las restricciones por IP, que con un túnel de
+    acceso son falsas: todos los jugadores llegan desde la misma IP.
+    Se edita por líneas para no perder los comentarios del YAML.
     """
     if not CONFIG_AUTHME.is_file():
         return False
@@ -674,6 +706,10 @@ def configurar_authme() -> bool:
     if cambiado:
         CONFIG_AUTHME.write_text("".join(lineas))
         ok("AuthMe: base GeoIP desactivada (hacía falta una clave MaxMind de pago).")
+    for clave, valor in AJUSTES_AUTHME.items():
+        if _ajustar_yaml(clave, valor):
+            log(f"AuthMe: {clave} = {valor} (con túnel todos parecen la misma IP).")
+            cambiado = True
     return cambiado
 
 
