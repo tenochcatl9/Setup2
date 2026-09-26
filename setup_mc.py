@@ -12,7 +12,9 @@ Script de despliegue para servidor de Minecraft Paper en Codespaces.
   El servidor admite de la 1.10 hasta la última versión: ViaVersion y
   ViaBackwards mantienen el rango actualizado solos.
 - Levanta el servidor y espera a que escuche en el puerto 25565.
-- Expone el puerto con ProxVN (único túnel) mostrando una barra de carga.
+- Expone el puerto con un túnel público mostrando una barra de carga:
+  Asyx (principal, con registro SRV y subdominio permanente) y, si no está
+  disponible, Pinggy como respaldo.
 - Envía la dirección pública a un webhook de Discord.
 - Al terminar, sube los cambios a la rama principal del repositorio.
 
@@ -29,10 +31,9 @@ respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con
 sha256). Ese archivo SÍ se versiona a propósito: es lo que permite importar
 el mundo en otra máquina.
 
-Túnel: ProxVN en modo TCP (cliente oficial, SHA256 verificado), que asigna
-una IP:puerto pública. Es el único servicio de túnel que usa el script: si su
-servidor comunitario no está accesible, el script lo dice claramente y avisa
-por Discord, sin recurrir a ningún otro proveedor.
+Túnel: Asyx en modo TCP, que además publica un registro SRV para que el
+cliente de Minecraft entre solo con el hostname. Si no está dado de alta o no
+responde, el script cae automáticamente a Pinggy (solo ssh, sin cuenta).
 """
 
 import argparse
@@ -89,13 +90,6 @@ MANIFIESTO = "manifest.json"
 PAPER_API = "https://fill.papermc.io/v3/projects/paper"
 USER_AGENT = "CodeSpace-MC-Setup/1.0 (contact: tu@email.com)"
 
-# ProxVN: único servicio de túnel. Cliente oficial en Go, descargado de su
-# GitHub y verificado con el SHA256 publicado. Vive fuera del repositorio.
-PROXVN_REPO = "hoangtuvungcao/proxvn_tunnel_full"
-PROXVN_DIR = Path.home() / ".local" / "share" / "proxvn"
-PROXVN_BIN = PROXVN_DIR / "proxvn"
-PROXVN_SERVIDOR = "103.77.246.196:8882"
-PROXVN_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
 PUERTO_MC = 25565
 PUERTO_TUNEL = 80
 MEMORIA_INICIAL = "1G"
@@ -110,12 +104,10 @@ FIN_GITIGNORE = "# <<< FIN bloque gestionado por setup_mc.py <<<"
 
 RE_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 RE_VERSION_ESTABLE = re.compile(r"^\d+\.\d+(\.\d+)?$")
-# Hosts que aparecen en la salida de ProxVN pero no sirven para entrar al juego.
-HOSTS_NO_TUNEL = {"localhost", "bacsycay.click", "www.bacsycay.click",
-                  "github.com", "www.github.com", "twitter.com",
-                  "maxmind.com", "www.maxmind.com", "dev.maxmind.com",
-                  "papermc.io", "www.papermc.io", "fill.papermc.io",
-                  "docs.gitlab.com", "gitlab.com"}
+# Hosts que salen en la consola de los túneles pero no sirven para entrar al juego.
+HOSTS_NO_TUNEL = {"localhost", "github.com", "www.github.com", "twitter.com",
+                  "papermc.io", "www.papermc.io", "asyx.ai", "www.asyx.ai",
+                  "pinggy.io", "www.pinggy.io"}
 
 # Rutas que nunca deben entrar en un commit
 PATRON_SENSIBLE = re.compile(
@@ -1137,310 +1129,391 @@ class NotificadorTunel:
         else:
             self._enviar(f"❌ **No se pudo abrir el túnel**\n{motivo}")
 
-# ─── 9. ProxVN: instalación, parser y lanzadores ───────────────────────────
-RE_PROXVN_DIR = re.compile(
-    r"(?:public\s*(?:address|url|endpoint|ip|server)\s*[:=]\s*"
-    r"|địa\s*chỉ\s*(?:công\s*cộng|public)?\s*[:=]\s*"
-    r"|forwarding\s*[:=]\s*)([^\s]+)", re.IGNORECASE)
-RE_HOST_PUERTO = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b")
-RE_URL = re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9.-]*)(?::(\d{2,5}))?")
+# ─── 9. Túneles: Asyx (principal) y Pinggy (respaldo) ─────────────────────
+# Asyx: nativo de Minecraft, subdominio permanente y registro SRV (el jugador
+# escribe solo el hostname). Necesita alta con email, una vez.
+# Pinggy: solo ssh, sin cuenta, pero con tope de 60 min y URL cambiante.
+ASYX_REGISTRO = "https://asyx.ai/register"
+ASYNX_DOMINIO = ".tunnel.asyx.ai"
+PINGGY_SERVIDOR = "free.pinggy.io"
+PINGGY_PUERTO = 443
+PINGGY_AVISO = ("Pinggy gratis corta el túnel a los 60 minutos y cambia la "
+                "dirección al reconectar: la IP de Discord quedará obsoleta.")
+
+RE_PINGGY_TCP = re.compile(r"tcp://([A-Za-z0-9][A-Za-z0-9.-]*):(\d{2,5})", re.IGNORECASE)
+RE_ASYX_HOST = re.compile(r"\b([A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*"
+                          r"\.tunnel\.asyx\.ai)\b", re.IGNORECASE)
+RE_HOST_PUERTO = re.compile(r"\b([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}):(\d{2,5})\b")
 
 
-def _asset_proxvn_para_arquitectura() -> tuple:
-    arch = PROXVN_ARCH.get(os.uname().machine.lower(), "")
-    if not arch:
-        raise RuntimeError(f"Arquitectura no soportada por ProxVN: {os.uname().machine}")
-    return f"proxvn-linux-{arch}", "SHA256SUMS-client.txt"
+# ── Utilidades comunes ─────────────────────────────────────────────────────
+def _dividir_host_puerto(valor: str, puerto_defecto=None) -> str:
+    """Normaliza 'host', 'host:puerto' o 'tcp://host:puerto' a 'host:puerto'."""
+    valor = RE_ANSI.sub("", valor or "").strip()
+    valor = re.sub(r"^[a-z]+://", "", valor, flags=re.IGNORECASE)
+    m = RE_HOST_PUERTO.search(valor)
+    if m:
+        return f"{m.group(1)}:{m.group(2)}"
+    if valor and puerto_defecto:
+        return f"{valor}:{puerto_defecto}"
+    return valor
 
 
-def instalar_proxvn(forzar: bool = False) -> Path | None:
-    """Descarga el cliente oficial de ProxVN y verifica su SHA256.
-
-    Se guarda en ~/.local/share/proxvn (fuera del repositorio).
-    """
-    if PROXVN_BIN.is_file() and os.access(PROXVN_BIN, os.X_OK) and not forzar:
-        log(f"ProxVN ya instalado ({PROXVN_BIN}).")
-        return PROXVN_BIN
-    nombre_binario, nombre_sumas = _asset_proxvn_para_arquitectura()
-    barra = Barra(f"Descargando {nombre_binario}", total=None)
+def _servidor_alcanzable(host: str, puerto: int, timeout: int = 6) -> bool:
     try:
-        headers = {"Accept": "application/vnd.github+json"}
-        rel = requests.get(f"https://api.github.com/repos/{PROXVN_REPO}/releases/latest",
-                           headers=headers, timeout=30)
-        rel.raise_for_status()
-        release = rel.json()
-        assets = {a["name"]: a for a in release.get("assets", [])}
-        if nombre_binario not in assets or nombre_sumas not in assets:
-            raise RuntimeError(f"El release {release.get('tag_name')} no trae {nombre_binario}.")
-        log(f"ProxVN {release.get('tag_name')} (checksum oficial: {nombre_sumas})")
-
-        suma_declarada = ""
-        r = requests.get(assets[nombre_sumas]["browser_download_url"], timeout=60)
-        r.raise_for_status()
-        for linea in r.text.splitlines():
-            partes = linea.split()
-            if len(partes) >= 2 and partes[-1].lstrip("*") == nombre_binario:
-                suma_declarada = partes[0].strip().lower()
-        if not suma_declarada:
-            raise RuntimeError("El archivo de sumas no incluye el binario; "
-                               "no se continúa sin verificación.")
-
-        PROXVN_DIR.mkdir(parents=True, exist_ok=True)
-        temporal = PROXVN_BIN.with_suffix(".descarga")
-        with requests.get(assets[nombre_binario]["browser_download_url"],
-                          stream=True, timeout=300) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length") or 0)
-            barra.total = total or None
-            with open(temporal, "wb") as f:
-                for trozo in resp.iter_content(262144):
-                    if trozo:
-                        f.write(trozo)
-                        if total:
-                            barra.avanzar(len(trozo))
-        barra.finalizar("Descarga completada")
-
-        suma_real = _sha256_archivo(temporal)
-        if suma_real != suma_declarada:
-            temporal.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"El binario no coincide con el SHA256 oficial.\n"
-                f"    esperado: {suma_declarada}\n    obtenido: {suma_real}")
-        ok("SHA256 verificado contra el publicado por el proyecto.")
-        temporal.replace(PROXVN_BIN)
-        PROXVN_BIN.chmod(0o755)
-    except Exception as e:  # noqa: BLE001
-        barra.finalizar()
-        error(f"No se pudo preparar ProxVN: {e}")
-        return None
-    ok(f"ProxVN instalado en {PROXVN_BIN}")
-    return PROXVN_BIN
-
-
-def _es_puerto_del_servidor(puerto: str) -> bool:
-    return puerto == PROXVN_SERVIDOR.rsplit(":", 1)[-1]
-
-
-def _direccion_valida(host: str, puerto: str) -> bool:
-    if not host or host.lower() in HOSTS_NO_TUNEL or host in ("localhost", "0.0.0.0"):
-        return False
-    if host.startswith(("127.", "0.", "10.", "192.168.", "169.254.")):
-        return False
-    if _es_puerto_del_servidor(puerto):
-        return False
-    return True
-
-
-def _host_valido(host: str) -> bool:
-    if not host or host.lower() in HOSTS_NO_TUNEL:
-        return False
-    etiquetas = host.lower().split(".")
-    if any(e in ("admin", "docs", "faq", "status", "blog", "www") for e in etiquetas[:-1]):
-        return False
-    return len(etiquetas) >= 3
-
-def buscar_direccion_proxvn(texto: str) -> str:
-    """Saca la dirección pública del cliente ProxVN.
-
-    Solo se aceptan las líneas que el propio cliente etiqueta como públicas:
-        Public URL: https://abc123.bacsycay.click      (proto http)
-        Public Address: 103.77.246.196:34567           (proto tcp)
-    A propósito NO se rastrean IPs sueltas: los mensajes de conexión incluyen
-    IPs públicas de salida del cliente (p. ej. "your connection id is
-    20.171.127.65:61960") que no sirven para entrar al servidor.
-    """
-    for linea in texto.splitlines():
-        limpia = _sin_ansi(linea).strip()
-        m = RE_PROXVN_DIR.search(limpia)
-        if not m:
-            continue
-        valor = m.group(1).strip().rstrip(",;")
-        mu = RE_URL.match(valor)
-        if mu and _host_valido(mu.group(1)):
-            puerto = mu.group(2) or str(PUERTO_TUNEL)
-            if _direccion_valida(mu.group(1), puerto):
-                return f"{mu.group(1)}:{puerto}"
-        mh = RE_HOST_PUERTO.search(valor)
-        if mh and _direccion_valida(mh.group(1), mh.group(2)):
-            return f"{mh.group(1)}:{mh.group(2)}"
-    return ""
-
-
-def _servidor_proxvn_alcanzable(servidor: str = None, timeout: int = 6) -> bool:
-    """Comprueba por TCP si se puede hablar con el servidor de túneles de ProxVN."""
-    host, _, puerto = (servidor or PROXVN_SERVIDOR).partition(":")
-    try:
-        with socket.create_connection((host, int(puerto or 8882)), timeout=timeout):
+        with socket.create_connection((host, puerto), timeout=timeout):
             return True
     except OSError:
         return False
 
 
-def _diagnostico_proxvn(caso: str, servidor: str = None) -> str:
-    """Explica por qué falló ProxVN, con una comprobación real de red."""
-    servidor = servidor or PROXVN_SERVIDOR
-    host, _, puerto = servidor.partition(":")
-    if _servidor_proxvn_alcanzable(servidor):
-        return (f"el servidor {servidor} sí responde desde esta máquina, pero {caso}. "
-                f"Prueba a mano:  {PROXVN_BIN} --proto tcp --port 25565")
-    return (f"esta máquina no consigue abrir una conexión TCP con el servidor de "
-            f"túneles {servidor} y, además, {caso}.\n"
-            f"    Compruébalo con:  nc -vz {host} {puerto or '8882'}\n"
-            f"    Ojo: ProxVN usa un único servidor comunitario. Que esté encendido no "
-            f"basta: si tu red o tu proveedor bloquean esa IP:puerto, no hay túnel.\n"
-            f"    Opciones:  (1) ejecutar desde una red que lo permita, "
-            f"(2) permitir la salida a {host}:{puerto or '8882'}, "
-            f"(3) autohospedar ProxVN en un VPS propio y usar "
-            f"--tunel-servidor TUDIRECCION:{puerto or '8882'}")
+def _comando_existe(nombre: str) -> bool:
+    return shutil.which(nombre) is not None
 
 
-def cmd_proxvn(puerto: int, binario: Path = None, servidor: str = None) -> list:
-    base = [str(binario or PROXVN_BIN), "--ui=false", "--proto", "tcp",
-            "--host", "localhost", "--port", str(puerto),
-            "--server", servidor or PROXVN_SERVIDOR]
-    # El cliente bufferiza la salida: sin esto, la IP no aparece hasta que muere.
-    if shutil.which("stdbuf"):
-        return ["stdbuf", "-oL", "-eL", *base]
-    return base
+def _preguntar(texto: str) -> str:
+    """Pregunta al usuario. Devuelve la opción en minúscula ('' si no hay TTY)."""
+    if not sys.stdin.isatty():
+        return ""
+    try:
+        return input(texto).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
 
 
-def _prechequear_servidor_proxvn(servidor: str, notificador=None) -> bool:
-    """Falla rápido si el servidor de túneles no es alcanzable desde aquí.
+# ── Proveedor: Asyx ────────────────────────────────────────────────────────
+def asyx_esta_alto() -> bool:
+    """True si ya se hizo el alta (certificados en ~/.asyx)."""
+    base = Path.home() / ".asyx"
+    if not base.is_dir():
+        return False
+    return any(base.iterdir())
 
-    Evita esperar el timeout entero cuando el problema es de red: se comprueba
-    en unos segundos y el motivo queda claro.
-    """
-    global MOTIVO_FALLO_TUNEL
-    if _servidor_proxvn_alcanzable(servidor):
+
+def asyx_preparar() -> bool:
+    """Comprueba Node y pide el alta si falta. True si queda listo para usar."""
+    if not _comando_existe("node") or not (_comando_existe("npx") or _comando_existe("npm")):
+        error("Asyx necesita Node.js 18.17+ (no lo encuentro en el PATH).")
+        log("    Instálalo y vuelve a ejecutar el script; Pinggy es el respaldo.")
+        return False
+    if asyx_esta_alto():
+        log("Asyx ya está dado de alta (~/.asyx).")
         return True
-    MOTIVO_FALLO_TUNEL = _diagnostico_proxvn("el cliente no llegó a conectar", servidor)
-    if notificador:
-        notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL.splitlines()[0])
-    error(f"No se abre túnel ProxVN: {MOTIVO_FALLO_TUNEL}")
+    titulo("ASYX NECESITA UNA CUENTA (solo esta vez)")
+    print(f"  1) Crea una cuenta gratuita en:  {ASYX_REGISTRO}")
+    print("     (solo email, sin tarjeta)")
+    print("  2) Vuelve aquí y ejecuta el alta, que abre el navegador para")
+    print("     verificar el email y reservar tu subdominio permanente.")
+    print()
+    if _preguntar("  ¿Lanzar ahora el alta de Asyx? [s/N]: ") == "s":
+        log("Abriendo el navegador de alta... complétalo y vuelve aquí.")
+        try:
+            return subprocess.run(["npx", "-y", "asyx@latest", "setup"],
+                                  timeout=300).returncode == 0 and asyx_esta_alto()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            error(f"No se pudo completar el alta: {e}")
+    else:
+        log("Puedes hacerlo más tarde con:  npx -y asyx@latest setup")
+    if asyx_esta_alto():
+        ok("Asyx dado de alta.")
+        return True
+    aviso("Asyx sigue sin alta: se usará Pinggy como respaldo.")
     return False
 
 
-def iniciar_tunel_proxvn(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL,
-                         notificador=None, servidor: str = None) -> tuple:
-    """Lanza ProxVN (TCP) y devuelve (direccion, proceso)."""
+def asyx_prechequear() -> tuple:
+    """(ok, motivo). Sin red que comprobar: lo decisivo es el alta local."""
+    if asyx_esta_alto():
+        return True, ""
+    return False, ("no tienes cuenta de Asyx (falta el alta). Créala en "
+                   f"{ASYX_REGISTRO} y ejecuta: npx -y asyx@latest setup")
+
+
+def asyx_comando(puerto: int) -> list:
+    """--minecraft es lo que publica el registro SRV para el cliente Java."""
+    return ["npx", "-y", "asyx@latest", "tunnel", "--minecraft", "--port", str(puerto)]
+
+
+def asyx_parsear(texto: str) -> str:
+    """Saca el host:puerto público de la salida de Asyx.
+
+    Acepta las dos formas: 'host:puerto' explícito o solo el hostname (en ese
+    caso se consulta el SRV para averiguar el puerto).
+    """
+    for linea in texto.splitlines():
+        limpia = _sin_ansi(linea).strip()
+        m = RE_HOST_PUERTO.search(limpia)
+        if m and m.group(1).lower().endswith(ASYNX_DOMINIO):
+            return f"{m.group(1)}:{m.group(2)}"
+        mh = RE_ASYX_HOST.search(limpia)
+        if mh:
+            host = mh.group(1)
+            puerto = _preguntar_puerto_srv(host)
+            if puerto:
+                return f"{host}:{puerto}"
+    return ""
+
+
+def _preguntar_puerto_srv(host: str):
+    """Consulta _minecraft._tcp.<host> para saber el puerto sin escribirlo."""
+    if not _comando_existe("dig"):
+        return None
+    try:
+        r = subprocess.run(["dig", "+short", "SRV", f"_minecraft._tcp.{host}"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for linea in r.stdout.splitlines():
+        partes = linea.split()
+        if len(partes) == 4 and partes[3].rstrip(".").lower() == host.lower():
+            return partes[2]
+    return None
+
+
+def asyx_srv_soportado(host: str) -> bool:
+    """True si el jugador puede entrar solo con el hostname (SRV publicado)."""
+    return _preguntar_puerto_srv(host) is not None
+
+
+# ── Proveedor: Pinggy ──────────────────────────────────────────────────────
+def pinggy_preparar() -> bool:
+    if not _comando_existe("ssh"):
+        error("Pinggy necesita el cliente ssh, que no está en el PATH.")
+        return False
+    return True
+
+
+def pinggy_prechequear() -> tuple:
+    if _servidor_alcanzable(PINGGY_SERVIDOR, PINGGY_PUERTO, timeout=8):
+        return True, ""
+    return False, (f"no hay conexión con {PINGGY_SERVIDOR}:{PINGGY_PUERTO} "
+                   f"desde esta máquina (compruébalo con: nc -vz "
+                   f"{PINGGY_SERVIDOR} {PINGGY_PUERTO})")
+
+
+def pinggy_comando(puerto: int) -> list:
+    # Sin -N a propósito: la URL se emite en la sesión, con -N nunca llega.
+    return [
+        "ssh", "-T", "-p", str(PINGGY_PUERTO),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+        "-R", f"0:localhost:{puerto}",
+        f"tcp@{PINGGY_SERVIDOR}",
+    ]
+
+
+def pinggy_parsear(texto: str) -> str:
+    """Solo la línea TCP: ignora las URL http/https y el debugger local."""
+    for linea in texto.splitlines():
+        m = RE_PINGGY_TCP.search(_sin_ansi(linea))
+        if m:
+            return f"{m.group(1)}:{m.group(2)}"
+    return ""
+
+
+# ── Registro de proveedores ────────────────────────────────────────────────
+PROVEEDORES = {
+    "asyx": {
+        "nombre": "Asyx",
+        "preparar": asyx_preparar,
+        "prechequear": asyx_prechequear,
+        "comando": asyx_comando,
+        "parsear": asyx_parsear,
+        "aviso": None,
+    },
+    "pinggy": {
+        "nombre": "Pinggy",
+        "preparar": pinggy_preparar,
+        "prechequear": pinggy_prechequear,
+        "comando": pinggy_comando,
+        "parsear": pinggy_parsear,
+        "aviso": PINGGY_AVISO,
+    },
+}
+ORDEN_PROVEEDORES = ("asyx", "pinggy")
+
+
+def _esperar_direccion(cola: queue.Queue, barra: Barra, timeout: int,
+                       parsear, notificador) -> tuple:
+    """Lee la salida hasta obtener la dirección pública. Devuelve (dir, terminó)."""
+    direccion = ""
+    while time.time() - barra.inicio < timeout:
+        try:
+            linea = cola.get(timeout=0.2)
+        except queue.Empty:
+            barra.refrescar()
+            if notificador:
+                notificador.pulso(barra)
+            continue
+        if linea is None:
+            break
+        texto = _sin_ansi(linea).rstrip()
+        if texto:
+            limpiar_linea()
+            print(f"    {texto}")
+        direccion = parsear(texto) or direccion
+        if direccion:
+            break
+    return direccion
+
+
+def _intentar_proveedor(clave: str, puerto: int, timeout: int, notificador) -> tuple:
+    """Prueba un proveedor. Devuelve (direccion, proceso, ok, motivo)."""
     global MOTIVO_FALLO_TUNEL
+    prov = PROVEEDORES[clave]
+    nombre = prov["nombre"]
     MOTIVO_FALLO_TUNEL = ""
-    servidor = servidor or PROXVN_SERVIDOR
-    if not _prechequear_servidor_proxvn(servidor, notificador):
-        return "", None
-    binario = PROXVN_BIN if PROXVN_BIN.is_file() else instalar_proxvn()
-    if binario is None:
-        return "", None
+
+    bien, motivo = prov["prechequear"]()
+    if not bien:
+        return "", None, False, motivo
+    if not prov["preparar"]():
+        return "", None, False, "no se pudo completar la preparación"
+
     cola: queue.Queue = queue.Queue()
     try:
-        proc = subprocess.Popen(
-            cmd_proxvn(puerto, binario, servidor), stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-        )
-    except FileNotFoundError:
-        error("No se pudo ejecutar el cliente de ProxVN.")
-        return "", None
+        proc = subprocess.Popen(prov["comando"](puerto), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+    except FileNotFoundError as e:
+        return "", None, False, f"no se pudo ejecutar el cliente ({e})"
     threading.Thread(target=_bombeo_salida, args=(proc, cola), daemon=True).start()
-    barra = Barra(f"Levantando ProxVN ({servidor})", limite=timeout)
+    barra = Barra(f"Levantando túnel con {nombre}", limite=timeout)
     if notificador:
         notificador.iniciar(barra)
-    direccion = ""
-    terminado = False
-    try:
-        while time.time() - barra.inicio < timeout:
-            if proc.poll() is not None:
-                terminado = True
-                break
-            try:
-                linea = cola.get(timeout=0.2)
-            except queue.Empty:
-                barra.refrescar()
-                if notificador:
-                    notificador.pulso(barra)
-                continue
-            if linea is None:
-                terminado = True
-                break
-            texto = _sin_ansi(linea).rstrip()
-            if texto:
-                limpiar_linea()
-                print(f"    {texto}")
-            direccion = buscar_direccion_proxvn(texto) or direccion
-            if direccion:
-                break
-        _drenar(cola)
-    finally:
-        barra.finalizar("ProxVN activo" if direccion else None)
+    direccion = _esperar_direccion(cola, barra, timeout, prov["parsear"], notificador)
+    _drenar(cola)
+    barra.finalizar(f"{nombre} activo" if direccion else None)
     if not direccion:
-        if notificador:
-            notificador.finalizar(motivo="ProxVN no dio dirección pública")
-        if terminado:
-            MOTIVO_FALLO_TUNEL = _diagnostico_proxvn("el cliente terminó sin imprimir dirección", servidor)
+        if proc.poll() is not None:
+            MOTIVO_FALLO_TUNEL = f"{nombre} terminó sin dar dirección pública"
         else:
-            MOTIVO_FALLO_TUNEL = _diagnostico_proxvn(f"no respondió en {timeout}s", servidor)
-        error(f"Fallo de ProxVN: {MOTIVO_FALLO_TUNEL}")
+            MOTIVO_FALLO_TUNEL = f"{nombre} no dio dirección pública en {timeout}s"
         _detener_proceso(proc, escribir_stop=False, timeout=5)
-        return "", None
-    ok(f"Dirección para Minecraft: {direccion}")
-    return direccion, proc
+        return "", None, False, MOTIVO_FALLO_TUNEL
+    return direccion, proc, True, ""
 
 
-def iniciar_tunel_proxvn_detached(puerto: int, timeout: int = TIMEOUT_TUNEL,
-                                  notificador=None, servidor: str = None) -> tuple:
-    """ProxVN desacoplado: sobrevive a la salida del script."""
-    global MOTIVO_FALLO_TUNEL
+def _intentar_proveedor_detached(clave: str, puerto: int, timeout: int, notificador) -> tuple:
+    """Igual que _intentar_proveedor pero dejando el proceso vivo."""
+    prov = PROVEEDORES[clave]
+    nombre = prov["nombre"]
     MOTIVO_FALLO_TUNEL = ""
-    servidor = servidor or PROXVN_SERVIDOR
-    if not _prechequear_servidor_proxvn(servidor, notificador):
-        return "", None
-    binario = PROXVN_BIN if PROXVN_BIN.is_file() else instalar_proxvn()
-    if binario is None:
-        raise RuntimeError("ProxVN no está disponible.")
-    mango = _abrir_log(LOG_TUNEL)
+
+    bien, motivo = prov["prechequear"]()
+    if not bien:
+        return "", None, False, motivo
+    if not prov["preparar"]():
+        return "", None, False, "no se pudo completar la preparación"
+
+    mango = _abrir_log(LOG_TUNEL, truncar=True)
     try:
-        proc = subprocess.Popen(
-            cmd_proxvn(puerto, binario, servidor), stdin=subprocess.DEVNULL, stdout=mango,
-            stderr=subprocess.STDOUT, start_new_session=True,
-        )
-    except FileNotFoundError:
-        raise RuntimeError("No se encontró el cliente de ProxVN.")
+        proc = subprocess.Popen(prov["comando"](puerto), stdin=subprocess.DEVNULL,
+                                stdout=mango, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    except FileNotFoundError as e:
+        return "", None, False, f"no se pudo ejecutar el cliente ({e})"
     finally:
         mango.close()
     PID_TUNEL.write_text(f"{proc.pid}\n")
-    barra = Barra(f"Levantando ProxVN ({servidor})", limite=timeout)
+    barra = Barra(f"Levantando túnel con {nombre}", limite=timeout)
     if notificador:
         notificador.iniciar(barra)
+    direccion = ""
     try:
         while time.time() - barra.inicio < timeout:
             if proc.poll() is not None:
                 barra.finalizar()
-                if notificador:
-                    notificador.finalizar(motivo="ProxVN terminó sin dar dirección")
-                detalle = _sin_ansi(LOG_TUNEL.read_text(errors="replace")).strip()
-                MOTIVO_FALLO_TUNEL = detalle[-200:] or "el cliente de ProxVN murió sin salida"
-                error(f"ProxVN terminó antes de dar la dirección:\n{MOTIVO_FALLO_TUNEL}")
-                _limpiar_pid(PID_TUNEL)
-                return "", None
-            direccion = buscar_direccion_proxvn(_sin_ansi(LOG_TUNEL.read_text(errors="replace")))
+                MOTIVO_FALLO_TUNEL = f"{nombre} terminó sin dar dirección pública"
+                break
+            try:
+                direccion = prov["parsear"](_sin_ansi(LOG_TUNEL.read_text(errors="replace")))
+            except OSError:
+                direccion = ""
             if direccion:
-                barra.finalizar("ProxVN activo")
-                if notificador:
-                    notificador.finalizar(ip=direccion)
-                return direccion, proc
+                barra.finalizar(f"{nombre} activo")
+                return direccion, proc, True, ""
             barra.refrescar()
             if notificador:
                 notificador.pulso(barra)
             time.sleep(0.2)
         barra.finalizar()
-        MOTIVO_FALLO_TUNEL = _diagnostico_proxvn(f"no respondió en {timeout}s", servidor)
-        if notificador:
-            notificador.finalizar(motivo="ProxVN no dio dirección pública")
-        error(f"No se obtuvo la dirección de ProxVN: {MOTIVO_FALLO_TUNEL}")
+        if not direccion and not MOTIVO_FALLO_TUNEL:
+            MOTIVO_FALLO_TUNEL = f"{nombre} no dio dirección pública en {timeout}s"
         _matar_pid(proc.pid)
         _limpiar_pid(PID_TUNEL)
-        return "", None
+        return "", None, False, MOTIVO_FALLO_TUNEL
     finally:
         barra.finalizar()
+
+
+def _abrir_con_respaldo(modo: str, puerto: int, notificador, detached: bool) -> tuple:
+    """Prueba los proveedores en orden hasta obtener un túnel verificado.
+
+    Devuelve (direccion, proceso, proveedor_usado, avisos).
+    """
+    if modo not in ("auto", *PROVEEDORES):
+        raise RuntimeError(f"Túnel desconocido: {modo}. "
+                           f"Usa: auto, {', '.join(PROVEEDORES)}")
+    orden = ORDEN_PROVEEDORES if modo == "auto" else (modo,)
+    problemas = []
+    for i, clave in enumerate(orden):
+        if i and notificador:
+            notificador.finalizar(
+                motivo=f"{PROVEEDORES[clave]['nombre']} no disponible, "
+                       f"probando {PROVEEDORES[orden[-1]]['nombre']}")
+        obtener = _intentar_proveedor_detached if detached else _intentar_proveedor
+        direccion, proc, bien, motivo = obtener(clave, puerto, TIMEOUT_TUNEL, notificador)
+        if bien and _listo_para_verificar(direccion):
+            avisos = [PROVEEDORES[clave]["aviso"]] if PROVEEDORES[clave]["aviso"] else []
+            return direccion, proc, clave, avisos
+        if proc is not None:
+            if detached:
+                _matar_pid(proc.pid)
+                _limpiar_pid(PID_TUNEL)
+            else:
+                _detener_proceso(proc, escribir_stop=False, timeout=5)
+        if direccion:
+            problemas.append(f"{PROVEEDORES[clave]['nombre']}: {direccion} no responde")
+        else:
+            problemas.append(f"{PROVEEDORES[clave]['nombre']}: {motivo}")
+    global MOTIVO_FALLO_TUNEL
+    MOTIVO_FALLO_TUNEL = " | ".join(problemas)
+    error("Ningún túnel pudo abrirse:\n    - " + "\n    - ".join(problemas))
+    return "", None, "", []
+
+
+def diagnostico_tunel() -> int:
+    """Comprueba en segundos qué proveedores pueden funcionar desde aquí."""
+    titulo("DIAGNÓSTICO DE TÚNELES")
+    for clave in ORDEN_PROVEEDORES:
+        prov = PROVEEDORES[clave]
+        print()
+        log(f"--- {prov['nombre']} ---")
+        if clave == "asyx":
+            if asyx_esta_alto():
+                ok("Cuenta creada y lista para usar (~/.asyx).")
+            elif _comando_existe("node") and _comando_existe("npx"):
+                aviso("Sin alta todavía: crea la cuenta en " + ASYX_REGISTRO +
+                      " y ejecuta  npx -y asyx@latest setup")
+            else:
+                error("Falta Node.js 18.17+ (no se puede instalar el CLI).")
+        else:
+            log(f"Probando conexión con {PINGGY_SERVIDOR}:{PINGGY_PUERTO}...")
+            inicio = time.time()
+            bien, motivo = prov["prechequear"]()
+            if bien:
+                ok(f"Alcanzable en {time.time() - inicio:.1f}s.")
+            else:
+                error(motivo)
+            aviso(PINGGY_AVISO)
+    print()
+    aviso("El script usa Asyx y cae a Pinggy automáticamente.")
+    return 0
 
 
 # ─── 10. Utilidades del túnel ─────────────────────────────────────────────
@@ -1472,45 +1545,29 @@ def _listo_para_verificar(host_puerto: str) -> bool:
     return comprobar_tunel(host, int(puerto))
 
 
-def _sin_tunel() -> tuple:
-    return "", None
-
-
-def abrir_tunel(puerto: int, notificador=None, timeout: int = TIMEOUT_TUNEL,
-                servidor: str = None) -> tuple:
-    """Abre el túnel con ProxVN y devuelve (direccion, proceso).
+def abrir_tunel(puerto: int, notificador=None, modo: str = "auto",
+                timeout: int = TIMEOUT_TUNEL) -> tuple:
+    """Abre túnel (Asyx, con Pinggy de respaldo) y devuelve (dir, proc, usado, avisos).
 
     Comprueba siempre que la dirección obtenida responde de verdad: así una IP
     inventada o un puerto equivocado nunca se anuncian como si fueran el
     servidor.
     """
-    direccion, proc = iniciar_tunel_proxvn(puerto, timeout=timeout, notificador=notificador,
-                                          servidor=servidor)
-    if direccion and _listo_para_verificar(direccion):
-        ok(f"Túnel ProxVN verificado: {direccion}")
-        return direccion, proc
-    if proc is not None:
-        _detener_proceso(proc, escribir_stop=False, timeout=5)
+    direccion, proc, usado, avisos = _abrir_con_respaldo(modo, puerto, notificador,
+                                                         detached=False)
     if direccion:
-        error(f"La dirección {direccion} no responde; se descarta el túnel.")
-    return _sin_tunel()
+        ok(f"Túnel {PROVEEDORES[usado]['nombre']} verificado: {direccion}")
+    return direccion, proc, usado, avisos
 
 
-def abrir_tunel_detached(puerto: int, notificador=None,
-                         timeout: int = TIMEOUT_TUNEL, servidor: str = None) -> tuple:
-    """ProxVN desacoplado: el túnel sigue vivo aunque el script termine."""
-    direccion, proc = iniciar_tunel_proxvn_detached(puerto, timeout=timeout,
-                                                    notificador=notificador,
-                                                    servidor=servidor)
-    if direccion and _listo_para_verificar(direccion):
-        ok(f"Túnel ProxVN verificado: {direccion}")
-        return direccion, proc
-    if proc is not None:
-        _matar_pid(proc.pid)
-    _limpiar_pid(PID_TUNEL)
+def abrir_tunel_detached(puerto: int, notificador=None, modo: str = "auto",
+                         timeout: int = TIMEOUT_TUNEL) -> tuple:
+    """Igual que abrir_tunel() pero dejando el túnel vivo tras salir."""
+    direccion, proc, usado, avisos = _abrir_con_respaldo(modo, puerto, notificador,
+                                                         detached=True)
     if direccion:
-        error(f"La dirección {direccion} no responde; se descarta el túnel.")
-    return _sin_tunel()
+        ok(f"Túnel {PROVEEDORES[usado]['nombre']} verificado: {direccion}")
+    return direccion, proc, usado, avisos
 
 
 # ─── 12. Modo "--solo-notificar": procesos en segundo plano ───────────────
@@ -1557,20 +1614,33 @@ def _limpiar_pid(ruta: Path):
         pass
 
 
-def _abrir_log(ruta: Path):
+def _abrir_log(ruta: Path, truncar: bool = False):
+    """Abre un log para escribir. Con truncar=True se borra lo anterior.
+
+    Imprescindible para el log del túnel: si se acumulara, el parser leería la
+    dirección del túnel de una ejecución previa y anunciaría una IP muerta.
+    """
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    f = open(ruta, "a", buffering=1)
+    f = open(ruta, "w" if truncar else "a", buffering=1)
     f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
     return f
 
 
 def direccion_en_log(ruta: Path) -> str:
-    """Última dirección pública de ProxVN que aparece en su log."""
+    """Última dirección pública de túnel que aparece en su log.
+
+    Se prueban los parsers de todos los proveedores: así sirve para recuperar
+    un túnel anterior sin saber cuál se usó.
+    """
     try:
         texto = _sin_ansi(ruta.read_text(errors="replace"))
     except OSError:
         return ""
-    return buscar_direccion_proxvn(texto)
+    for prov in PROVEEDORES.values():
+        direccion = prov["parsear"](texto)
+        if direccion:
+            return direccion
+    return ""
 
 
 CODIGO_PUENTE_CONSOLA = """
@@ -1688,21 +1758,23 @@ def modo_notificacion(args) -> int:
     if webhook and not args.sin_notificar_tunel:
         notificador = NotificadorTunel(webhook)
 
-    # 3. Túnel ProxVN
+    # 3. Túnel (Asyx, con Pinggy de respaldo)
     direccion = ""
+    avisos_tunel = []
+    proveedor_usado = ""
     pid_tunel = _leer_pid(PID_TUNEL)
     if _vivo(pid_tunel):
         previa = direccion_en_log(LOG_TUNEL)
         if previa and _listo_para_verificar(previa):
             direccion = previa
-            ok(f"El túnel ProxVN anterior sigue vivo (PID {pid_tunel}): {direccion}")
+            ok(f"El túnel anterior sigue vivo (PID {pid_tunel}): {direccion}")
     if not direccion:
         _parar_anterior(PID_TUNEL, "túnel")
         if args.sin_tunnel:
             aviso("Túnel omitido (--sin-tunnel): la IP no será pública.")
         else:
-            direccion, _proc = abrir_tunel_detached(args.puerto, notificador=notificador,
-                                                   servidor=args.tunel_servidor)
+            direccion, _proc, proveedor_usado, avisos_tunel = abrir_tunel_detached(
+                args.puerto, notificador=notificador, modo=args.tunel)
 
     # 4. Aviso con la IP (o con el motivo del fallo)
     notificar_servidor(webhook, direccion, args.puerto, MOTIVO_FALLO_TUNEL)
@@ -1713,11 +1785,15 @@ def modo_notificacion(args) -> int:
     print("  SERVIDOR Y TÚNEL EN SEGUNDO PLANO")
     print("=" * 62)
     print(f"  IP pública    : {direccion or '(sin túnel)'}")
+    if proveedor_usado:
+        print(f"  Servicio      : {PROVEEDORES[proveedor_usado]['nombre']}")
     print(f"  Versiones     : {rango_versiones()}  (ViaVersion + ViaBackwards)")
     print("  Login         : AuthMe  (regístrate la primera vez, luego /login)")
     print(f"  Servidor PID  : {_leer_pid(PID_SERVIDOR) or '?'}   (log: {LOG_SERVIDOR})")
     print(f"  Túnel PID     : {_leer_pid(PID_TUNEL) or '?'}   (log: {LOG_TUNEL})")
     print()
+    for extra in avisos_tunel:
+        aviso(extra)
     print("  Ver la consola  :  tail -f logs/servidor.log")
     print("  Mandar comando  :  echo 'op Jugador' > consola   (o 'say hola', 'list'...)")
     print("  Cerrar túnel    :  kill $(cat tunel.pid)    # la IP deja de servir")
@@ -2219,13 +2295,15 @@ def _al_interrumpir(signum, frame):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Servidor de Minecraft Paper + túnel ProxVN")
+    p = argparse.ArgumentParser(description="Servidor de Minecraft Paper + túnel público")
     p.add_argument("--puerto", type=int, default=PUERTO_MC, help="Puerto del servidor (25565)")
     p.add_argument("--memoria", default=MEMORIA_MAXIMA, help="Memoria máxima, p. ej. 3G")
     p.add_argument("--sin-tunnel", action="store_true", help="No levantar ningún túnel")
-    p.add_argument("--tunel-servidor", metavar="HOST:PUERTO", default="",
-                   help="Usar tu propio servidor ProxVN (autohospedado) en lugar del "
-                        "servidor comunitario por defecto")
+    p.add_argument("--tunel", choices=("auto", *PROVEEDORES), default="auto",
+                   help="Servicio de túnel: asyx (por defecto), pinggy o auto "
+                        "(Asyx con respaldo a Pinggy)")
+    p.add_argument("--tunel-diag", action="store_true",
+                   help="Comprobar en segundos si el túnel puede abrirse y salir")
     p.add_argument("--sin-push", action="store_true", help="No hacer commit/push al final")
     p.add_argument("--sin-respaldo", action="store_true",
                    help="No comprimir el servidor antes de subirlo")
@@ -2304,6 +2382,10 @@ def main():
     configurar_gitignore()
     exigir_env_protegido()
 
+    # 0a. Diagnóstico del túnel
+    if args.tunel_diag:
+        return diagnostico_tunel()
+
     # 0bis. Comprobación rápida del webhook (falla en 1s si está muerto)
     if args.probar_webhook:
         webhook = obtener_webhook()
@@ -2322,6 +2404,8 @@ def main():
     tunel_proc = None
     cola = None
     direccion = ""
+    proveedor_usado = ""
+    avisos_tunel = []
     listo_para_subir = False
     codigo = 0
 
@@ -2350,10 +2434,12 @@ def main():
             raise RuntimeError(f"El servidor no abrió el puerto {args.puerto} a tiempo.")
         configurar_authme()  # la config de AuthMe existe tras el primer arranque
 
-        # 3. Túnel ProxVN con barra de carga
+        # 3. Túnel con barra de carga (Asyx, con Pinggy de respaldo)
         if not args.sin_tunnel:
-            direccion, tunel_proc = abrir_tunel(args.puerto, notificador=notificador,
-                                               servidor=args.tunel_servidor)
+            direccion, tunel_proc, proveedor_usado, avisos_tunel = abrir_tunel(
+                args.puerto, notificador=notificador, modo=args.tunel)
+            for extra in avisos_tunel:
+                aviso(extra)
         else:
             aviso("Túnel omitido (--sin-tunnel).")
 
@@ -2373,6 +2459,8 @@ def main():
         print(f"  Ruta local   : {SERVER_DIR}")
         print(f"  Puerto local : {args.puerto}")
         print(f"  Dirección MC : {direccion or '(sin túnel)'}")
+        if proveedor_usado:
+            print(f"  Servicio     : {PROVEEDORES[proveedor_usado]['nombre']}")
         print(f"  Versiones    : {rango_versiones()}  (ViaVersion + ViaBackwards)")
         print("  Login        : AuthMe  (regístrate la primera vez, luego /login)")
         print("  Presiona Ctrl+C para detener el servidor y cerrar el túnel.")
@@ -2399,7 +2487,7 @@ def main():
         elif listo_para_subir:
             titulo("SUBIENDO CAMBIOS A LA RAMA PRINCIPAL")
             subir_cambios(
-                f"chore: servidor Minecraft en la raíz local y túnel ProxVN ({args.rama})",
+                f"chore: servidor Minecraft en la raíz local y túnel Asyx ({args.rama})",
                 rama=args.rama,
                 con_respaldo=not args.sin_respaldo,
                 con_jar=not args.respaldo_sin_jar,
