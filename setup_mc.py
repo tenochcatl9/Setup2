@@ -468,9 +468,20 @@ def generar_plugins_dir(timeout_arranque: int = TIMEOUT_ARRANQUE):
             barra.finalizar("Mundo y plugins generados")
         else:
             barra.finalizar("Aviso: no se confirmó el arranque, se continúa igualmente")
+        # El puente del FIFO hace que 'echo "save-all flush" > consola' y el
+        # respaldo automático hablen con el servidor también en primer plano.
+        _lanzar_puente_consola(proc)
+        if not args_sin_backup_auto():
+            if arrancar_backups_auto():
+                log(f"Respaldo automático cada {BACKUP_AUTO_MINUTOS} min en "
+                    f"respaldo/auto/ (se guardan los {BACKUP_AUTO_MANTENER} últimos).")
     finally:
         _detener_proceso(proc, escribir_stop=True)
         log("Servidor detenido.")
+
+
+def args_sin_backup_auto() -> bool:
+    return "--sin-backup-auto" in sys.argv
 
 
 def _detener_proceso(proc, escribir_stop: bool = True, timeout: int = 30):
@@ -783,6 +794,10 @@ def _contenido_gitignore() -> str:
         "# (es la forma de importar el mundo en otro equipo/máquina)",
         "!respaldo/",
         "!respaldo/**",
+        # Los respaldos automáticos (cada 20 min) son solo locales: unos 45 MB
+        # cada 20 min meterían ~3 GB al día en el historial. El que se
+        # versiona es respaldo/servidor-mc.tar.zst, que se regenera al parar.
+        "respaldo/auto/",
         "",
         "# Python",
         "__pycache__/",
@@ -2115,6 +2130,8 @@ def arrancar_servidor_detached(puerto: int):
         mango.close()
     PID_SERVIDOR.write_text(f"{proc.pid}\n")
     _lanzar_puente_consola(proc)
+    if not args_sin_backup_auto():
+        arrancar_backups_auto()
     return proc
 
 
@@ -2184,6 +2201,8 @@ def modo_notificacion(args) -> int:
         print(f"  Servicio      : {PROVEEDORES[proveedor_usado]['nombre']}")
     print(f"  Versiones     : {rango_versiones()}  (ViaVersion + ViaBackwards)")
     print(f"  Skins         : SkinsRestorer {version_skinsrestorer()}  (se actualiza al correr)")
+    print(f"  Respaldo auto : cada {BACKUP_AUTO_MINUTOS} min en respaldo/auto/ "
+          f"({BACKUP_AUTO_MANTENER} últimos, sin parar el servidor)")
     print("  Login         : AuthMe  (regístrate la primera vez, luego /login)")
     print(f"  Servidor PID  : {_leer_pid(PID_SERVIDOR) or '?'}   (log: {LOG_SERVIDOR})")
     print(f"  Túnel PID     : {_leer_pid(PID_TUNEL) or '?'}   (log: {LOG_TUNEL})")
@@ -2429,6 +2448,138 @@ def _hash_contenido(directorio: Path, incluir: list) -> tuple:
         resumen.update(_sha256_archivo(ruta).encode())
     return total, resumen.hexdigest()
 
+
+# ─── Respaldo automático en caliente (sin parar el servidor) ─────────────
+# Cada BACKUP_AUTO_MINUTOS se empaqueta el mundo mientras el servidor sigue
+# dando servicio. El peligro es copiar ficheros a medio escribir: por eso antes
+# se congela el mundo con save-off/save-all flush y se descongela al terminar.
+BACKUP_AUTO_MINUTOS = 20
+BACKUP_AUTO_MANTENER = 4          # cuántos respaldos automáticos se conservan
+DIR_BACKUP_AUTO = SERVER_DIR / "respaldo" / "auto"
+_HILO_BACKUPS = None
+
+
+def _consola(linea: str) -> bool:
+    """Escribe una orden en el servidor por el FIFO de la consola.
+
+    Se usa el FIFO y no el proc del servidor para que funcione igual con el
+    servidor en primer plano y en segundo plano.
+    """
+    if not linea:
+        return False
+    try:
+        # O_NONBLOCK es imprescindible: abrir un FIFO para escribir sin un
+        # lector se queda bloqueado para siempre, y el hilo de respaldos
+        # (y el propio script) se quedarían colgados.
+        fd = os.open(FIFO_CONSOLA, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        os.write(fd, (linea + "\n").encode("utf-8", "replace"))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _purgar_backups_auto() -> None:
+    """Deja solo los BACKUP_AUTO_MANTENER más recientes."""
+    try:
+        backups = sorted(DIR_BACKUP_AUTO.glob("mundo-*.tar.zst"),
+                         key=lambda x: x.name, reverse=True)
+    except OSError:
+        return
+    for viejo in backups[BACKUP_AUTO_MANTENER:]:
+        try:
+            viejo.unlink()
+            log(f"    Borrado el respaldo automático antiguo {viejo.name}.")
+        except OSError:
+            pass
+
+
+def respaldo_automatico() -> bool:
+    """Empaqueta el mundo SIN parar el servidor.
+
+    Congela las escrituras (save-off + save-all flush), empaqueta, y siempre
+    vuelve a poner save-on: si el servidor se quedara con save-off activated,
+    el mundo dejaría de guardarse y se perdería el progreso de los jugadores.
+    """
+    if not (SERVER_DIR / "world").is_dir():
+        return False
+    congelado = False
+    # Red de seguridad: si este proceso muriese con el mundo congelado, el
+    # servidor seguiría sin guardar y los jugadores perderían progreso.
+    watchdog = None
+    try:
+        if _vivo(_leer_pid(PID_SERVIDOR)) and _consola("save-off"):
+            _consola("save-all flush")
+            congelado = True
+
+            def _descongelar():
+                _consola("save-on")
+
+            watchdog = threading.Timer(BACKUP_AUTO_MINUTOS * 30, _descongelar)
+            watchdog.daemon = True
+            watchdog.start()
+            time.sleep(3)      # margen para que el servidor termine de volcar
+        incluir = [q for q in BACKUP_INCLUYE if q != "server.jar"]
+        archivos, hash_contenido = _hash_contenido(SERVER_DIR, incluir)
+        destino = DIR_BACKUP_AUTO / f"mundo-{time.strftime('%Y%m%d-%H%M%S')}.tar.zst"
+        manifiesto = {
+            "creado": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "paper": _version_paper() or "desconocida",
+            "minecraft": _version_mc_del_jar() or "desconocida",
+            "con_server_jar": False,
+            "automatico": True,
+            "contenido_sha256": hash_contenido,
+            "archivos": archivos,
+        }
+        _empaquetar(destino, manifiesto, incluir)
+        miembros = _miembros_de_respaldo(destino)
+        if MANIFIESTO not in miembros or not any(m.startswith("world/") for m in miembros):
+            destino.unlink(missing_ok=True)
+            error("El respaldo automático no parecía válido; se borra.")
+            return False
+        malos = [m for m in miembros if _miembro_peligroso(m)]
+        if malos:
+            destino.unlink(missing_ok=True)
+            error("El respaldo automático traía ficheros sensibles; se borra.")
+            return False
+        ok(f"Respaldo automático: respaldo/auto/{destino.name} "
+           f"({destino.stat().st_size / 1048576:,.0f} MB)")
+        _purgar_backups_auto()
+        return True
+    except (OSError, RuntimeError) as e:
+        error(f"No se pudo hacer el respaldo automático: {e}")
+        return False
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        if congelado:
+            _consola("save-on")
+
+
+def _bucle_backups_auto(intervalo_min: int) -> None:
+    while True:
+        time.sleep(intervalo_min * 60)
+        try:
+            if _vivo(_leer_pid(PID_SERVIDOR)):
+                respaldo_automatico()
+        except Exception:  # noqa: BLE001
+            pass          # el respaldo automático nunca debe tumbar el script
+
+
+def arrancar_backups_auto(intervalo_min: int = BACKUP_AUTO_MINUTOS) -> bool:
+    """Lanza el hilo del respaldo automático (una sola vez)."""
+    global _HILO_BACKUPS
+    if _HILO_BACKUPS is not None and _HILO_BACKUPS.is_alive():
+        return False
+    _HILO_BACKUPS = threading.Thread(target=_bucle_backups_auto,
+                                     args=(intervalo_min,), daemon=True,
+                                     name="respaldo-automatico")
+    _HILO_BACKUPS.start()
+    return True
 
 def _empaquetar(destino: Path, manifiesto: dict, incluir: list) -> tuple:
     """Escribe el tar comprimido con el manifiesto dentro. Devuelve (bytes, segundos)."""
@@ -2852,6 +3003,8 @@ def parse_args():
                    help="No comprimir el servidor antes de subirlo")
     p.add_argument("--respaldo-sin-jar", action="store_true",
                    help="Respaldo sin server.jar (~7 MB en vez de ~70 MB)")
+    p.add_argument("--sin-backup-auto", action="store_true",
+                   help="No hacer respaldos automáticos mientras el servidor corre")
     p.add_argument("--parar", action="store_true",
                    help="Cerrar el túnel y parar el servidor, y salir")
     p.add_argument("--forzar-respaldo", action="store_true",

@@ -49,6 +49,7 @@ consola
 # (es la forma de importar el mundo en otro equipo/máquina)
 !respaldo/
 !respaldo/**
+respaldo/auto/
 
 # Python
 __pycache__/
