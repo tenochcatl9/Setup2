@@ -484,15 +484,12 @@ def _detener_proceso(proc, escribir_stop: bool = True, timeout: int = 30):
         except (BrokenPipeError, OSError, ValueError):
             pass
     else:
-        try:
-            proc.terminate()
-        except (OSError, AttributeError, ValueError):
-            pass
+        _senal_grupo(proc.pid, signal.SIGTERM)
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         aviso("El proceso no se detuvo a tiempo; forzando cierre...")
-        proc.kill()
+        _senal_grupo(proc.pid, signal.SIGKILL)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -1907,31 +1904,101 @@ def _leer_pid(ruta: Path):
 
 
 def _vivo(pid) -> bool:
+    """True si el proceso existe y no es un zombie ya terminado.
+
+    os.kill(pid, 0) sigue respondiendo OK para un proceso defunct, así que
+    sin esta comprobación un proceso muerto parecería vivo y el script
+    esperaría a un cierre que ya ocurrió.
+    """
     if not pid:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except (OSError, ProcessLookupError, PermissionError):
         return False
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            estado = f.read().rsplit(b")", 1)[-1].split()[0]
+        return estado != b"Z"
+    except (OSError, IndexError, ValueError):
+        return True
+
+
+def _senal_grupo(pid, sig) -> bool:
+    """Envía una señal al proceso y, si es líder de su grupo, al grupo entero.
+
+    El túnel se lanza con start_new_session=True, así que npm -> sh -> node
+    quedan en su propio grupo. Matar solo al PID madre dejaba vivo el proceso
+    node y el túnel seguía sirviendo (túneles huérfanos). El servidor no es
+    líder de grupo, así que ahí solo se señaliza su PID: hacerlo al grupo
+    mataría también al script.
+    """
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, sig)
+        else:
+            os.kill(pid, sig)
+        return True
+    except OSError:
+        try:
+            os.kill(pid, sig)
+            return True
+        except OSError:
+            return False
+
+
+def _descendientes(pid: int) -> list:
+    """PIDs de todos los descendientes de pid, hojas primero.
+
+    El cliente de Asyx se encadena como npm -> sh -> node. Si solo se mata al
+    líder, el node sobrevive (además de quedar re-parentado a init y fuera del
+    grupo), y el túnel sigue sirviendo con la IP antigua.
+    """
+    hijos: dict = {}
+    try:
+        entradas = os.listdir("/proc")
+    except OSError:
+        return []
+    for entrada in entradas:
+        if not entrada.isdigit():
+            continue
+        try:
+            # El campo comm puede traer espacios y paréntesis, así que se
+            # parte por el último ")": después van state y ppid.
+            with open(f"/proc/{entrada}/stat", "rb") as f:
+                campos = f.read().rsplit(b")", 1)[-1].split()
+            ppid = int(campos[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        hijos.setdefault(ppid, []).append(int(entrada))
+    salida: list = []
+    pila = [pid]
+    while pila:
+        for hijo in hijos.get(pila.pop(), []):
+            pila.append(hijo)
+            salida.append(hijo)
+    return salida
 
 
 def _matar_pid(pid, espera: float = 5.0) -> bool:
+    """Mata un proceso y toda su descendencia (grupo y árbol)."""
     if not _vivo(pid):
         return False
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
+    arbol = _descendientes(pid)
+    for hijo in arbol:
+        _senal_grupo(hijo, signal.SIGTERM)
+    if not _senal_grupo(pid, signal.SIGTERM):
         return False
     fin = time.time() + espera
     while time.time() < fin:
         if not _vivo(pid):
-            return True
+            break
         time.sleep(0.2)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
+    for hijo in arbol:
+        if _vivo(hijo):
+            _senal_grupo(hijo, signal.SIGKILL)
+    if _vivo(pid):
+        _senal_grupo(pid, signal.SIGKILL)
     return True
 
 
@@ -2125,8 +2192,8 @@ def modo_notificacion(args) -> int:
         aviso(extra)
     print("  Ver la consola  :  tail -f logs/servidor.log")
     print("  Mandar comando  :  echo 'op Jugador' > consola   (o 'say hola', 'list'...)")
-    print("  Cerrar túnel    :  kill $(cat tunel.pid)    # la IP deja de servir")
-    print("  Parar servidor  :  kill $(cat servidor.pid)")
+    print("  Cerrar túnel    :  python3 setup_mc.py --parar   # o: kill -- -$(cat tunel.pid)")
+    print("  Parar servidor  :  python3 setup_mc.py --parar   # o: kill $(cat servidor.pid)")
     print("=" * 62)
     print()
 
@@ -2785,6 +2852,8 @@ def parse_args():
                    help="No comprimir el servidor antes de subirlo")
     p.add_argument("--respaldo-sin-jar", action="store_true",
                    help="Respaldo sin server.jar (~7 MB en vez de ~70 MB)")
+    p.add_argument("--parar", action="store_true",
+                   help="Cerrar el túnel y parar el servidor, y salir")
     p.add_argument("--forzar-respaldo", action="store_true",
                    help="Reempaquetar aunque el mundo no haya cambiado")
     p.add_argument("--solo-notificar", action="store_true",
@@ -2839,9 +2908,38 @@ def preparar_servidor(args) -> bool:
     return True
 
 
+def parar_todo() -> int:
+    """Cierra el túnel y para el servidor usando el grupo de procesos.
+
+    Sin esto no había forma fiable de pararlos: `kill $(cat tunel.pid)` mata
+    al envoltorio npm y deja vivo el proceso node de Asyx.
+    """
+    titulo("PARANDO TÚNEL Y SERVIDOR")
+    pid = _leer_pid(PID_TUNEL)
+    if pid and _vivo(pid):
+        log(f"Cerrando túnel (PID {pid})...")
+        _matar_pid(pid, espera=10)
+        ok("Túnel cerrado.")
+    else:
+        log("No hay túnel activo.")
+    _limpiar_pid(PID_TUNEL)
+
+    pid = _leer_pid(PID_SERVIDOR)
+    if pid and _vivo(pid):
+        log(f"Parando servidor (PID {pid}); Minecraft guarda el mundo...")
+        _matar_pid(pid, espera=60)
+        ok("Servidor parado.")
+    else:
+        log("No hay servidor activo.")
+    _limpiar_pid(PID_SERVIDOR)
+    return 0
+
+
 def main():
     global MEMORIA_INICIAL, MEMORIA_MAXIMA
     args = parse_args()
+    if args.parar:
+        return parar_todo()
     MEMORIA_MAXIMA = args.memoria
     if MEMORIA_INICIAL.endswith("G") and args.memoria.endswith("G"):
         MEMORIA_INICIAL = f"{max(1, int(args.memoria[:-1]) // 2)}G"
