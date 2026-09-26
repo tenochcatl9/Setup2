@@ -1099,6 +1099,15 @@ def arrancar_servidor(puerto: int):
         raise RuntimeError("No se encontró 'java' en el PATH.")
     cola: queue.Queue = queue.Queue()
     threading.Thread(target=_bombeo_salida, args=(proc, cola), daemon=True).start()
+    # El puente del FIFO y el hilo de respaldos automáticos hacen falta aquí
+    # también: este es el camino normal (servidor ya existente), no solo el de
+    # la instalación inicial. Sin el puente, el respaldo automático no puede
+    # congelar el mundo con save-off.
+    _lanzar_puente_consola(proc)
+    if not args_sin_backup_auto():
+        if arrancar_backups_auto():
+            log(f"Respaldo automático cada {BACKUP_AUTO_MINUTOS} min en "
+                f"respaldo/auto/ (se guardan los {BACKUP_AUTO_MANTENER} últimos).")
     return proc, cola
 
 
