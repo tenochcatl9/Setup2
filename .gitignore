@@ -36,6 +36,11 @@ generated/
 *.lock
 *.part
 
+# El respaldo comprimido del servidor SÍ se versiona a propósito
+# (es la forma de importar el mundo en otro equipo/máquina)
+!respaldo/
+!respaldo/**
+
 # Python
 __pycache__/
 *.py[cod]

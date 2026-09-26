@@ -18,10 +18,21 @@ Modos:
   python3 setup_mc.py                  flujo completo (servidor en primer plano)
   python3 setup_mc.py --solo-notificar deja servidor y túnel en segundo plano,
                                        avisa a Discord con la IP y sube a Git
+  python3 setup_mc.py --probar-webhook comprueba el webhook de Discord y sale
+  python3 setup_mc.py --importar owner/repo
+                                       restaura el mundo desde un .tar.zst
+
+Antes de subir cambios a la rama principal se comprime el servidor en
+respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con
+sha256). Ese archivo SÍ se versiona a propósito: es lo que permite importar
+el mundo en otra máquina.
 """
 
 import argparse
+import fnmatch
+import hashlib
 import itertools
+import json
 import os
 import queue
 import re
@@ -30,8 +41,10 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 try:
@@ -60,6 +73,8 @@ LOG_SERVIDOR = LOGS_DIR / "servidor.log"
 LOG_TUNEL = LOGS_DIR / "tunel.log"
 PID_SERVIDOR = SERVER_DIR / "servidor.pid"
 PID_TUNEL = SERVER_DIR / "tunel.pid"
+RESPALDO_DIR = SERVER_DIR / "respaldo"
+MANIFIESTO = "manifest.json"
 
 PAPER_API = "https://fill.papermc.io/v3/projects/paper"
 USER_AGENT = "CodeSpace-MC-Setup/1.0 (contact: tu@email.com)"
@@ -71,6 +86,7 @@ MEMORIA_INICIAL = "1G"
 MEMORIA_MAXIMA = "2G"
 TIMEOUT_TUNEL = 60
 TIMEOUT_ARRANQUE = 240
+MOTIVO_FALLO_TUNEL = ""
 
 INICIO_GITIGNORE = "# >>> INICIO bloque gestionado por setup_mc.py >>>"
 FIN_GITIGNORE = "# <<< FIN bloque gestionado por setup_mc.py <<<"
@@ -94,6 +110,15 @@ PATRON_SENSIBLE = re.compile(
     re.IGNORECASE,
 )
 EXENTAS_SENSIBLES = {".env.example", ".env.sample", ".env.template"}
+
+# Secretos reales: nunca deben ir ni a un commit ni dentro de un respaldo.
+RE_SECRETO = re.compile(
+    r"(^|/)\.env($|\.)"
+    r"|(^|/)(id_rsa|id_dsa|id_ecdsa|id_ed25519)$"
+    r"|\.pem$|\.key$|\.p12$|\.pfx$"
+    r"|(^|/)(credentials|secrets?)(\.|/|$)",
+    re.IGNORECASE,
+)
 
 # ─── Utilidades de salida ─────────────────────────────────────────────────
 _barra_activa = None
@@ -552,6 +577,11 @@ def _contenido_gitignore() -> str:
         "*.lock",
         "*.part",
         "",
+        "# El respaldo comprimido del servidor SÍ se versiona a propósito",
+        "# (es la forma de importar el mundo en otro equipo/máquina)",
+        "!respaldo/",
+        "!respaldo/**",
+        "",
         "# Python",
         "__pycache__/",
         "*.py[cod]",
@@ -687,10 +717,42 @@ def guardar_webhook(url: str):
     log(f"Webhook guardado en {WEBHOOK_ENV_FILE} (permisos 600, fuera de Git).")
 
 
+def verificar_webhook(url: str) -> bool:
+    """Comprueba que el webhook existe (GET: no envía ningún mensaje)."""
+    if not url:
+        return False
+    if not _webhook_valido(url):
+        error("La URL del webhook no tiene el formato de Discord "
+              "(https://discord.com/api/webhooks/ID/TOKEN).")
+        return False
+    try:
+        r = requests.get(url, timeout=15)
+    except Exception as e:  # noqa: BLE001
+        error(f"No se pudo contactar con Discord: {e}")
+        return False
+    if r.status_code == 200:
+        try:
+            ok(f"Webhook verificado ({r.json().get('name', 'sin nombre')}).")
+        except ValueError:
+            ok("Webhook verificado.")
+        return True
+    if r.status_code in (401, 403):
+        error("El webhook fue borrado o su token ya no es válido "
+              f"(HTTP {r.status_code}). Crea uno nuevo en el canal de Discord.")
+    elif r.status_code == 404:
+        error("Ese webhook no existe (HTTP 404). Revisa la URL en .env.")
+    elif r.status_code == 429:
+        error("Discord está limitando las peticiones (HTTP 429). Espera unos segundos.")
+    else:
+        error(f"Discord respondió HTTP {r.status_code}: {r.text[:200]}")
+    return False
+
+
 def obtener_webhook() -> str:
     url = leer_webhook()
     if url:
-        log("Webhook de Discord cargado desde .env")
+        log(f"Webhook de Discord cargado desde {WEBHOOK_ENV_FILE.name}")
+        verificar_webhook(url)
         return url
     print()
     print("=" * 62)
@@ -700,26 +762,69 @@ def obtener_webhook() -> str:
     try:
         url = input("Pega aquí la URL del webhook (Enter para omitir): ").strip()
     except (EOFError, KeyboardInterrupt):
+        print()
         aviso("Sin webhook: se continuará sin notificar a Discord.")
         return ""
     if not url:
         aviso("Sin webhook: se continuará sin notificar a Discord.")
         return ""
-    if not _webhook_valido(url):
-        aviso("Esa URL no parece un webhook de Discord; se guardará pero no se enviará nada.")
+    if not verificar_webhook(url):
+        aviso("El webhook no responde; se guarda igualmente y se intentará avisar al final.")
     guardar_webhook(url)
     return url
 
 
-def enviar_a_discord(webhook_url: str, mensaje: str):
+def enviar_a_discord(webhook_url: str, mensaje: str) -> bool:
+    """POST con un reintento en 429/5xx. Devuelve True si se envió."""
     if not webhook_url:
-        return
-    try:
-        r = requests.post(webhook_url, json={"content": mensaje}, timeout=15)
-        r.raise_for_status()
-        ok("Mensaje enviado a Discord.")
-    except Exception as e:  # noqa: BLE001
-        error(f"No se pudo enviar el mensaje a Discord: {e}")
+        return False
+    for intento in (1, 2):
+        try:
+            r = requests.post(webhook_url, json={"content": mensaje}, timeout=20)
+        except Exception as e:  # noqa: BLE001
+            error(f"No se pudo enviar el mensaje a Discord: {e}")
+            return False
+        if r.status_code in (200, 204):
+            ok("Mensaje enviado a Discord.")
+            return True
+        if r.status_code == 429 and intento == 1:
+            espera = 2
+            try:
+                espera = float(json.loads(r.text or "{}").get("retry_after", 2))
+            except (ValueError, TypeError):
+                pass
+            aviso(f"Discord pide esperar {espera:.0f}s (límite de peticiones); reintento...")
+            time.sleep(min(espera, 10))
+            continue
+        if r.status_code >= 500 and intento == 1:
+            aviso(f"Discord devolvió HTTP {r.status_code}; reintento...")
+            time.sleep(2)
+            continue
+        error(f"Discord rechazó el mensaje: HTTP {r.status_code} — {r.text[:300]}")
+        if r.status_code in (401, 403, 404):
+            aviso("El webhook está muerto o revocado: crea uno nuevo y ponlo en .env.")
+        return False
+    error("No se pudo enviar el mensaje a Discord tras varios intentos.")
+    return False
+
+
+def _mensaje_activado(direccion: str, puerto: int, motivo_fallo: str = "") -> str:
+    if direccion:
+        return ("🎮 **Servidor de Minecraft activo**\n"
+                f"IP: `{direccion}`\n"
+                "Entra con cualquier versión de 1.8 a 1.21: ViaVersion y "
+                "ViaBackwards hacen de traductor.")
+    return ("⚠️ **Servidor de Minecraft arrancado, pero SIN IP pública**\n"
+            f"Puerto local: `{puerto}`\n"
+            f"QuickTunnel falló: {motivo_fallo or 'motivo desconocido'}\n"
+            "Hace falta salida a internet por el puerto 22 para abrir el túnel.")
+
+
+def notificar_servidor(webhook: str, direccion: str, puerto: int, motivo_fallo: str = "") -> bool:
+    """Avisa a Discord siempre: con la IP si la hay, o con el fallo si no."""
+    if not webhook:
+        return False
+    return enviar_a_discord(webhook, _mensaje_activado(direccion, puerto, motivo_fallo))
 
 
 # ─── 8. Levantar el servidor ─────────────────────────────────────────────
@@ -851,10 +956,13 @@ def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL) -
     finally:
         barra.finalizar("QuickTunnel activo" if host_publico else None)
     if not host_publico:
+        global MOTIVO_FALLO_TUNEL
         if terminado:
-            error("QuickTunnel terminó antes de dar la URL (¿sin salida a internet o puerto 22 bloqueado?).")
+            MOTIVO_FALLO_TUNEL = ("el proceso de ssh murió sin dar la URL "
+                                  f"(¿salida al puerto 22 de {QUICKTUNNEL_HOST}?)")
         else:
-            error(f"No se obtuvo la URL de QuickTunnel en {timeout} segundos.")
+            MOTIVO_FALLO_TUNEL = f"no respondió en {timeout}s"
+        error(f"No se obtuvo la URL de QuickTunnel: {MOTIVO_FALLO_TUNEL}")
         _detener_proceso(proc, escribir_stop=False, timeout=5)
         return "", None
     direccion_mc = f"{host_publico}:{PUERTO_TUNEL}"
@@ -961,6 +1069,8 @@ def arrancar_servidor_detached(puerto: int):
 
 def iniciar_tunel_detached(puerto: int, timeout: int = TIMEOUT_TUNEL) -> tuple:
     """QuickTunnel desacoplado. La URL se lee del log porque no hay tubería."""
+    global MOTIVO_FALLO_TUNEL
+    MOTIVO_FALLO_TUNEL = ""
     cmd = cmd_ssh(puerto)
     if shutil.which("stdbuf"):
         cmd = ["stdbuf", "-oL", "-eL", *cmd]
@@ -981,8 +1091,8 @@ def iniciar_tunel_detached(puerto: int, timeout: int = TIMEOUT_TUNEL) -> tuple:
             if proc.poll() is not None:
                 barra.finalizar()
                 detalle = LOG_TUNEL.read_text(errors="replace").strip() if LOG_TUNEL.is_file() else ""
-                error("QuickTunnel terminó antes de dar la URL:\n" +
-                      (detalle[-400:] or "(sin salida)"))
+                MOTIVO_FALLO_TUNEL = (detalle[-200:] or "el proceso de ssh murió sin salida")
+                error(f"QuickTunnel terminó antes de dar la URL:\n{MOTIVO_FALLO_TUNEL}")
                 _limpiar_pid(PID_TUNEL)
                 return "", None
             host = url_en_log(LOG_TUNEL)
@@ -992,9 +1102,9 @@ def iniciar_tunel_detached(puerto: int, timeout: int = TIMEOUT_TUNEL) -> tuple:
             barra.refrescar()
             time.sleep(0.2)
         barra.finalizar()
-        error(f"No se obtuvo la URL de QuickTunnel en {timeout} segundos.\n"
-              f"    Suele ser el firewall: QuickTunnel necesita salida TCP al puerto 22 "
-              f"de {QUICKTUNNEL_HOST}. Prübalo con:  nc -vz {QUICKTUNNEL_HOST} 22")
+        MOTIVO_FALLO_TUNEL = (f"sin salida a internet por el puerto 22 de {QUICKTUNNEL_HOST} "
+                              f"o el servicio no respondió en {timeout}s")
+        error(f"No se obtuvo la URL de QuickTunnel en {timeout} segundos: {MOTIVO_FALLO_TUNEL}")
         _matar_pid(proc.pid)
         _limpiar_pid(PID_TUNEL)
         return "", None
@@ -1050,17 +1160,9 @@ def modo_notificacion(args) -> int:
                 else:
                     aviso("El túnel aún no responde; puede tardar unos segundos más.")
 
-    # 3. Discord
+    # 3. Discord (siempre: con la IP o con el motivo del fallo)
     webhook = obtener_webhook()
-    if direccion:
-        enviar_a_discord(webhook, (
-            "🎮 **Servidor de Minecraft activo**\n"
-            f"IP: `{direccion}`\n"
-            "Entra con cualquier versión de 1.8 a 1.21: ViaVersion y "
-            "ViaBackwards hacen de traductor."
-        ))
-    else:
-        aviso("Sin IP pública no hay nada que anunciar en Discord.")
+    notificar_servidor(webhook, direccion, args.puerto, MOTIVO_FALLO_TUNEL)
 
     # 4. Panel con cómo pararlo
     print()
@@ -1084,14 +1186,421 @@ def modo_notificacion(args) -> int:
         titulo("SUBIENDO CAMBIOS A LA RAMA PRINCIPAL")
         if not subir_cambios(
                 "chore: modo --solo-notificar (servidor y túnel en segundo plano)",
-                rama=args.rama):
+                rama=args.rama,
+                con_respaldo=not args.sin_respaldo,
+                con_jar=not args.respaldo_sin_jar):
             codigo = 1
     return codigo
 
 
-# ─── 11. Commit y push a la rama principal ───────────────────────────────
-def subir_cambios(mensaje: str, rama: str = "main") -> bool:
-    """Verifica secretos, hace commit y empuja a la rama principal."""
+# ─── 11. Respaldo comprimido e importación ───────────────────────────────
+# Rutas que se empaquetan (relativas a SERVER_DIR); el resto se regenera al importar.
+BACKUP_INCLUYE = ["server.jar", "world", "plugins", "config", ".paper",
+                  "server.properties", "eula.txt", "ops.json", "whitelist.json",
+                  "banned-players.json", "banned-ips.json", "usercache.json",
+                  "bukkit.yml", "spigot.yml", "commands.yml"]
+BACKUP_EXCLUYE = [".env", ".env.*", ".git", "*.pid", "*.log", "*.part",
+                  "libraries", "cache", "respaldo", "__pycache__"]
+TAMANO_ADVERTENCIA = 50 * 1024 * 1024
+TAMANO_MAXIMO = 100 * 1024 * 1024
+RESPALDO_ACTUAL: Path | None = None
+
+RE_RAW = re.compile(r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(.+)$", re.I)
+RE_REPO = re.compile(r"^([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
+RE_GITHUB = re.compile(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)", re.I)
+NOMBRES_RESPALDO = ("respaldo/servidor-mc.tar.zst", "respaldo/servidor-mc.tar.gz")
+
+
+def _relativo(ruta: Path) -> str:
+    try:
+        return ruta.resolve().relative_to(BASE_DIR).as_posix()
+    except ValueError:
+        return ruta.name
+
+
+def _sha256_archivo(ruta: Path) -> str:
+    h = hashlib.sha256()
+    with open(ruta, "rb") as f:
+        for bloque in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(bloque)
+    return h.hexdigest()
+
+
+def _compresor() -> tuple:
+    """(comando de compresión, extensión) del compresor disponible más compacto."""
+    if shutil.which("zstd"):
+        return ["zstd", "-19", "-T0", "-q", "-c"], ".tar.zst"
+    return ["gzip", "-9", "-c"], ".tar.gz"
+
+
+def _descompresor(ruta: Path) -> list:
+    if ruta.suffix == ".zst" and shutil.which("zstd"):
+        return ["zstd", "-dc", str(ruta)]
+    return ["gzip", "-dc", str(ruta)]
+
+
+def _paquete_respaldo() -> Path:
+    _, ext = _compresor()
+    return RESPALDO_DIR / f"servidor-mc{ext}"
+
+
+def _miembros_de_respaldo(ruta: Path) -> list:
+    """Lista el contenido del paquete sin extraerlo."""
+    with tempfile.TemporaryDirectory() as tmp:
+        plano = Path(tmp) / "p.tar"
+        with open(plano, "wb") as f:
+            r = subprocess.run(_descompresor(ruta), stdout=f, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"El paquete está corrupto: {(r.stderr or '').strip()[:200]}")
+        r = subprocess.run(["tar", "-tf", str(plano)], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("El paquete no se puede leer como tar.")
+        return [l for l in r.stdout.splitlines() if l.strip()]
+
+
+def _version_paper() -> str:
+    try:
+        texto = (LOGS_DIR / "latest.log").read_text(errors="replace")
+    except OSError:
+        return ""
+    m = (re.search(r"Running Paper ([\w.\-]+)", texto)
+         or re.search(r"running Paper version ([\w.\-]+)", texto))
+    return m.group(1) if m else ""
+
+
+def _version_mc_del_jar() -> str:
+    """Versión de Minecraft que declara el server.jar, sin arrancarlo."""
+    try:
+        with zipfile.ZipFile(SERVER_JAR) as z:
+            nombres = set(z.namelist())
+            for candidato in ("version.json", "META-INF/versions.list"):
+                if candidato in nombres:
+                    texto = z.read(candidato).decode("utf-8", errors="replace")
+                    m = re.search(r'"?id"?\s*[:=]\s*"([\w.\-]+)"', texto)
+                    if m and re.match(r"^\d", m.group(1)):
+                        return m.group(1)
+    except (OSError, zipfile.BadZipFile, KeyError):
+        pass
+    return ""
+
+
+def _excluido(rel: str) -> bool:
+    base = rel.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(base, pat)
+               for pat in BACKUP_EXCLUYE)
+
+
+def _miembro_peligroso(rel: str) -> bool:
+    """Un miembro del paquete es peligroso solo si es un secreto de verdad.
+
+    Los .jar, server.properties o eula.txt son normales dentro de un respaldo
+    (a diferencia de un commit, donde no deben subirse sueltos).
+    """
+    return bool(RE_SECRETO.search(rel))
+
+
+def _hash_contenido(directorio: Path, incluir: list) -> tuple:
+    """(nº de archivos, sha256) del contenido empaquetado, estable entre máquinas."""
+    archivos = []
+    for patron in incluir:
+        objetivo = directorio / patron
+        if objetivo.is_dir():
+            archivos.extend(sorted(p for p in objetivo.rglob("*") if p.is_file()))
+        elif objetivo.is_file():
+            archivos.append(objetivo)
+    resumen = hashlib.sha256()
+    total = 0
+    for ruta in archivos:
+        rel = ruta.relative_to(directorio).as_posix()
+        if _excluido(rel):
+            continue
+        total += 1
+        resumen.update(rel.encode())
+        resumen.update(_sha256_archivo(ruta).encode())
+    return total, resumen.hexdigest()
+
+
+def _empaquetar(destino: Path, manifiesto: dict, incluir: list) -> tuple:
+    """Escribe el tar comprimido con el manifiesto dentro. Devuelve (bytes, segundos)."""
+    compresor, _ = _compresor()
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    temporal = destino.with_suffix(destino.suffix + ".part")
+    with tempfile.TemporaryDirectory() as tmp:
+        man_tmp = Path(tmp) / MANIFIESTO
+        man_tmp.write_text(json.dumps(manifiesto, indent=2) + "\n")
+        cmd = ["tar", "-I", " ".join(compresor), "-cf", "-", "--ignore-failed-read"]
+        for patron in BACKUP_EXCLUYE:
+            cmd += ["--exclude", patron]
+        cmd += ["-C", tmp, MANIFIESTO, "-C", str(SERVER_DIR), *incluir]
+        with open(temporal, "wb") as f:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            barra = Barra(f"Comprimiendo {destino.name}", total=None)
+            inicio = time.time()
+            total = 0
+            while True:
+                trozo = proc.stdout.read(1024 * 1024)
+                if not trozo:
+                    break
+                f.write(trozo)
+                total += len(trozo)
+                barra.avanzar(len(trozo))
+            err = proc.stderr.read().decode(errors="replace")
+            rc = proc.wait()
+        if rc != 0:
+            temporal.unlink(missing_ok=True)
+            barra.finalizar()
+            raise RuntimeError(f"tar falló: {err.strip()[:200]}")
+    temporal.replace(destino)
+    barra.finalizar(f"{total / 1048576:,.1f} MB en {time.time() - inicio:.0f}s")
+    return total, time.time() - inicio
+
+
+def crear_respaldo(con_jar: bool = True) -> bool:
+    """Empaqueta el servidor en respaldo/servidor-mc.tar.zst y valida el contenido."""
+    global RESPALDO_ACTUAL
+    if not (SERVER_DIR / "world").is_dir():
+        aviso("No hay mundo guardado: se omite el respaldo.")
+        return False
+    incluir = [p for p in BACKUP_INCLUYE if con_jar or p != "server.jar"]
+    archivos, hash_contenido = _hash_contenido(SERVER_DIR, incluir)
+    RESPALDO_ACTUAL = _paquete_respaldo()
+    manifiesto = {
+        "creado": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "paper": _version_paper() or "desconocida",
+        "minecraft": _version_mc_del_jar() or "desconocida",
+        "con_server_jar": con_jar,
+        "contenido_sha256": hash_contenido,
+        "archivos": archivos,
+    }
+    try:
+        _empaquetar(RESPALDO_ACTUAL, manifiesto, incluir)
+    except RuntimeError as e:
+        error(str(e))
+        return False
+
+    miembros = _miembros_de_respaldo(RESPALDO_ACTUAL)
+    if MANIFIESTO not in miembros:
+        error("El respaldo no lleva manifiesto; se borra.")
+        RESPALDO_ACTUAL.unlink(missing_ok=True)
+        return False
+    malos = [m for m in miembros if _miembro_peligroso(m)]
+    if malos:
+        RESPALDO_ACTUAL.unlink(missing_ok=True)
+        error("El respaldo contenía archivos sensibles; se borra y no se sube:\n    - " +
+              "\n    - ".join(malos[:10]))
+        return False
+    if not any(m.startswith("world/") for m in miembros):
+        RESPALDO_ACTUAL.unlink(missing_ok=True)
+        error("El respaldo no contiene el mundo; se borra.")
+        return False
+    if _git(["check-ignore", "-q", _relativo(RESPALDO_ACTUAL)]).returncode == 0:
+        aviso(f"Atención: {_relativo(RESPALDO_ACTUAL)} está en .gitignore; "
+              f"se forzará su subida.")
+    tam = RESPALDO_ACTUAL.stat().st_size
+    if tam > TAMANO_ADVERTENCIA:
+        aviso(f"El respaldo pesa {tam / 1048576:,.0f} MB. GitHub avisa a partir de 50 MB y "
+              f"no acepta archivos de más de 100 MB: usa --respaldo-sin-jar "
+              f"para que pese ~7 MB.")
+    if tam > TAMANO_MAXIMO:
+        aviso(f"Supera los {TAMANO_MAXIMO // 1048576} MB: GitHub rechazará el push.")
+    ok(f"Respaldo listo: {_relativo(RESPALDO_ACTUAL)} "
+       f"(MC {manifiesto['minecraft']}, {archivos} archivos, "
+       f"{'con' if con_jar else 'sin'} server.jar)")
+    return True
+
+
+def _descargar_a(origen: str, destino: Path, headers: dict, barra: Barra) -> None:
+    """Descarga en streaming a un temporal y lo renombra al terminar."""
+    temporal = destino.with_suffix(destino.suffix + ".descarga")
+    with requests.get(origen, headers=headers, stream=True, timeout=300) as r:
+        if r.status_code == 404:
+            raise RuntimeError("No se encuentra el respaldo en esa ruta.")
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length") or 0)
+        barra.total = total or None
+        with open(temporal, "wb") as f:
+            for trozo in r.iter_content(1024 * 1024):
+                if trozo:
+                    f.write(trozo)
+                    if total:
+                        barra.avanzar(len(trozo))
+    temporal.replace(destino)
+
+
+def _rama_por_defecto(user: str, repo: str, headers: dict) -> str:
+    r = requests.get(f"https://api.github.com/repos/{user}/{repo}", headers=headers, timeout=20)
+    if r.status_code == 404:
+        raise RuntimeError(f"No existe el repositorio {user}/{repo} "
+                           f"(o es privado: se necesita un token).")
+    r.raise_for_status()
+    return r.json().get("default_branch") or "main"
+
+
+def _descargar_respaldo(origen: str, destino: Path) -> Path:
+    """Descarga un paquete desde owner/repo, URL de GitHub o URL directa."""
+    headers = {"User-Agent": USER_AGENT}
+    gh = {"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT}
+    origen = origen.strip().strip("'\"")
+    if not origen:
+        raise RuntimeError("No se indicó ningún repositorio.")
+    barra = Barra(f"Descargando {destino.name}", total=None)
+
+    m_raw = RE_RAW.match(origen)
+    m_repo = RE_REPO.match(origen)
+    m_gh = RE_GITHUB.match(origen)
+    if m_raw:
+        _descargar_a(origen, destino, headers, barra)
+    elif m_repo and not origen.startswith("http"):
+        user, repo = m_repo.group(1), m_repo.group(2)
+        rama = _rama_por_defecto(user, repo, gh)
+        log(f"Buscando el respaldo en {user}/{repo} (rama por defecto: {rama})...")
+        ultimo = None
+        for nombre in NOMBRES_RESPALDO:
+            url = f"https://raw.githubusercontent.com/{user}/{repo}/{rama}/{nombre}"
+            try:
+                _descargar_a(url, destino, headers, barra)
+                ultimo = None
+                break
+            except RuntimeError as e:
+                ultimo = e
+        if ultimo is not None:
+            raise RuntimeError(f"No hay ningún respaldo en {NOMBRES_RESPALDO[0]} "
+                               f"de {user}/{repo} (rama {rama}).")
+    elif m_gh:
+        user, repo = m_gh.group(1), m_gh.group(2).removesuffix(".git")
+        rama = _rama_por_defecto(user, repo, gh)
+        base = f"https://raw.githubusercontent.com/{user}/{repo}/{rama}"
+        log(f"Buscando el respaldo en {user}/{repo} (rama por defecto: {rama})...")
+        for nombre in NOMBRES_RESPALDO:
+            try:
+                _descargar_a(f"{base}/{nombre}", destino, headers, barra)
+                break
+            except RuntimeError:
+                continue
+        else:
+            raise RuntimeError(f"No hay ningún respaldo en {user}/{repo} (rama {rama}).")
+    else:
+        _descargar_a(origen, destino, headers, barra)
+    barra.finalizar("Descarga completada")
+    return destino
+
+
+def _leer_manifiesto(ruta: Path) -> dict:
+    with tempfile.TemporaryDirectory() as tmp:
+        plano = Path(tmp) / "p.tar"
+        with open(plano, "wb") as f:
+            r = subprocess.run(_descompresor(ruta), stdout=f, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"El paquete está corrupto: {(r.stderr or '').strip()[:200]}")
+        r = subprocess.run(["tar", "-xf", str(plano), "-C", tmp, MANIFIESTO],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not (Path(tmp) / MANIFIESTO).is_file():
+            raise RuntimeError("El paquete no trae manifest.json: no es un respaldo válido.")
+        return json.loads((Path(tmp) / MANIFIESTO).read_text())
+
+
+def _extraer_respaldo(origen: Path, destino: Path) -> None:
+    """Descomprime el paquete en `destino` (la raíz local), sin tocar .env ni Git."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        plano = base / "p.tar"
+        with open(plano, "wb") as f:
+            r = subprocess.run(_descompresor(origen), stdout=f, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"El paquete está corrupto: {(r.stderr or '').strip()[:200]}")
+        r = subprocess.run(["tar", "-xf", str(plano), "-C", str(base)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"No se pudo descomprimir: {(r.stderr or '').strip()[:200]}")
+        plano.unlink(missing_ok=True)
+        if (base / ".git").exists():
+            raise RuntimeError("El paquete contiene un .git: no se importa por seguridad.")
+        if (base / ".env").exists():
+            (base / ".env").unlink()
+            aviso("El paquete traía un .env (webhook); se descarta por seguridad.")
+        destino.mkdir(parents=True, exist_ok=True)
+        for hijo in sorted(base.iterdir()):
+            if hijo.name == MANIFIESTO:
+                continue
+            final = destino / hijo.name
+            if hijo.is_dir():
+                shutil.copytree(hijo, final, dirs_exist_ok=True)
+            else:
+                shutil.copy2(hijo, final)
+
+
+def importar_respaldo(origen: str) -> bool:
+    """Descarga, verifica y extrae un respaldo en la raíz local."""
+    _, ext = _compresor()
+    RESPALDO_DIR.mkdir(parents=True, exist_ok=True)
+    destino = RESPALDO_DIR / f"descargado{ext}"
+    archivo = _descargar_respaldo(origen, destino)
+    ok(f"Paquete descargado ({archivo.stat().st_size / 1048576:,.1f} MB).")
+    manifiesto = _leer_manifiesto(archivo)
+    _extraer_respaldo(archivo, SERVER_DIR)
+    archivo.unlink(missing_ok=True)
+
+    esperado = manifiesto.get("contenido_sha256", "")
+    if esperado:
+        incluir = [p for p in BACKUP_INCLUYE
+                   if manifiesto.get("con_server_jar", True) or p != "server.jar"]
+        _, hash_real = _hash_contenido(SERVER_DIR, incluir)
+        if hash_real != esperado:
+            error(f"El contenido extraído no coincide con el manifiesto.\n"
+                  f"    esperado: {esperado}\n    obtenido: {hash_real}")
+        else:
+            ok("Contenido verificado contra el manifiesto (sha256 correcto).")
+    log(f"Servidor importado: MC {manifiesto.get('minecraft', '?')}, "
+        f"Paper {manifiesto.get('paper', '?')}, {manifiesto.get('archivos', '?')} archivos.")
+    return True
+
+
+def preguntar_crear_o_importar() -> str:
+    """Menú cuando no hay servidor. Devuelve 'crear', 'importar' o 'cancelar'."""
+    print()
+    print("=" * 62)
+    print("  NO HAY NINGÚN SERVIDOR EN ESTA CARPETA")
+    print("=" * 62)
+    print("  1) Crear uno nuevo (descargar Paper y generar mundo)")
+    print("  2) Importar un respaldo (.tar.zst) desde un repositorio")
+    print("  3) Cancelar")
+    print("=" * 62)
+    if not sys.stdin.isatty():
+        aviso("Sin terminal interactiva: se crea uno nuevo.")
+        return "crear"
+    try:
+        opcion = input("Elige 1, 2 o 3 [1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        print()
+        aviso("Cancelado.")
+        return "cancelar"
+    if opcion in ("1", "crear", "nuevo", "c"):
+        return "crear"
+    if opcion in ("2", "importar", "i"):
+        return "importar"
+    if opcion in ("3", "cancelar", "x", "q"):
+        return "cancelar"
+    aviso("Opción no válida; se crea uno nuevo.")
+    return "crear"
+
+
+def preguntar_url_respaldo() -> str:
+    print()
+    print("  Formatos aceptados:")
+    print("    - owner/repo                     (p. ej. tenochcatl9/Setup2)")
+    print("    - https://github.com/owner/repo")
+    print("    - URL directa a un .tar.zst / .tar.gz")
+    try:
+        return input("  URL o owner/repo del respaldo: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+# ─── 12. Commit y push a la rama principal ───────────────────────────────
+def subir_cambios(mensaje: str, rama: str = "main", con_respaldo: bool = True,
+                  con_jar: bool = True) -> bool:
+    """Verifica secretos, crea el respaldo, hace commit y empuja a la rama principal."""
     if not es_repo_git():
         aviso("No es un repositorio Git: no se puede subir nada.")
         return False
@@ -1100,7 +1609,19 @@ def subir_cambios(mensaje: str, rama: str = "main") -> bool:
         error("No se sube nada porque la protección de secretos falló:")
         print(motivo, file=sys.stderr)
         return False
+
+    if con_respaldo:
+        if not crear_respaldo(con_jar=con_jar):
+            return False
+
     _git(["add", "-A"])
+    # El respaldo se versiona a propósito: si el .gitignore lo tapara, se fuerza.
+    if con_respaldo and RESPALDO_ACTUAL is not None:
+        rel = _relativo(RESPALDO_ACTUAL)
+        if rel not in _git(["diff", "--cached", "--name-only"]).stdout.splitlines():
+            log(f"Forzando la subida de {rel} (lo ignoraba el .gitignore).")
+            _git(["add", "-f", rel])
+
     staged = [p for p in _git(["diff", "--cached", "--name-only"]).stdout.splitlines() if p.strip()]
     if not staged:
         aviso("No hay cambios nuevos que subir.")
@@ -1120,9 +1641,14 @@ def subir_cambios(mensaje: str, rama: str = "main") -> bool:
     log(f"Empujando a origin/{rama} (rama actual: {actual})...")
     r = _git(["push", "origin", f"HEAD:{rama}"], capture=True)
     if r.returncode != 0:
-        error(f"No se pudo hacer push a {rama}:\n{(r.stderr or r.stdout).strip()}")
-        aviso(f"Resuélvelo manualmente con:  git pull --rebase origin {rama} && "
-              f"git push origin HEAD:{rama}")
+        detalle = (r.stderr or r.stdout).strip()
+        error(f"No se pudo hacer push a {rama}:\n{detalle}")
+        if "100 MB" in detalle or "too large" in detalle.lower():
+            aviso("GitHub no acepta archivos de más de 100 MB. Vuelve a generar el "
+                  "respaldo con  --respaldo-sin-jar  (queda en ~7 MB).")
+        else:
+            aviso(f"Resuélvelo manualmente con:  git pull --rebase origin {rama} && "
+                  f"git push origin HEAD:{rama}")
         return False
     ok(f"Cambios subidos a origin/{rama} ({hash_commit}).")
     return True
@@ -1140,11 +1666,58 @@ def parse_args():
     p.add_argument("--memoria", default=MEMORIA_MAXIMA, help="Memoria máxima, p. ej. 3G")
     p.add_argument("--sin-tunnel", action="store_true", help="No levantar QuickTunnel")
     p.add_argument("--sin-push", action="store_true", help="No hacer commit/push al final")
+    p.add_argument("--sin-respaldo", action="store_true",
+                   help="No comprimir el servidor antes de subirlo")
+    p.add_argument("--respaldo-sin-jar", action="store_true",
+                   help="Respaldo sin server.jar (~7 MB en vez de ~68 MB)")
     p.add_argument("--solo-notificar", action="store_true",
                    help="Deja servidor y túnel en segundo plano, avisa a Discord y sube a Git")
+    p.add_argument("--probar-webhook", action="store_true",
+                   help="Manda un mensaje de prueba a Discord y sale")
+    p.add_argument("--crear-nuevo", action="store_true",
+                   help="Si no hay servidor, crearlo sin preguntar")
+    p.add_argument("--importar", metavar="URL", default="",
+                   help="Importa un respaldo (owner/repo, URL de GitHub o URL directa)")
     p.add_argument("--reinstalar-plugins", action="store_true", help="Volver a descargar los plugins")
     p.add_argument("--rama", default="main", help="Rama a la que se empuja (main)")
     return p.parse_args()
+
+
+def preparar_servidor(args) -> bool:
+    """Deja el server.jar, la EULA y los plugins listos. False si se canceló."""
+    nuevo = not servidor_existe()
+    if nuevo:
+        if args.importar:
+            log(f"Importando respaldo desde: {args.importar}")
+        elif args.crear_nuevo:
+            aviso("No se encontró server.jar: se descargará Paper (--crear-nuevo).")
+        else:
+            opcion = preguntar_crear_o_importar()
+            if opcion == "cancelar":
+                return False
+            if opcion == "importar":
+                args.importar = preguntar_url_respaldo()
+                if not args.importar:
+                    error("No se indicó el repositorio del respaldo.")
+                    return False
+            else:
+                aviso("No se encontró server.jar: se descargará Paper.")
+        if args.importar:
+            try:
+                importar_respaldo(args.importar)
+            except Exception as e:  # noqa: BLE001
+                error(f"No se pudo importar: {e}")
+                return False
+            nuevo = False
+        else:
+            descargar_paper()
+    else:
+        log(f"Ya existe un servidor ({SERVER_JAR}).")
+    aceptar_eula()
+    if nuevo:
+        generar_plugins_dir()
+    instalar_plugins(forzar=args.reinstalar_plugins)
+    return True
 
 
 def main():
@@ -1168,17 +1741,19 @@ def main():
     configurar_gitignore()
     exigir_env_protegido()
 
+    # 0bis. Comprobación rápida del webhook (falla en 1s si está muerto)
+    if args.probar_webhook:
+        webhook = obtener_webhook()
+        if not webhook:
+            return 1
+        return 0 if enviar_a_discord(webhook, (
+            "✅ **Prueba de webhook**\n"
+            "El script se está comunicando bien con Discord. "
+            "Cuando arranque el servidor aquí irá la IP del túnel.")) else 1
+
     # 1. Servidor
-    nuevo = not servidor_existe()
-    if nuevo:
-        aviso("No se encontró server.jar: se descargará Paper.")
-        descargar_paper()
-    else:
-        log(f"Ya existe un servidor ({SERVER_JAR}).")
-    aceptar_eula()
-    if nuevo:
-        generar_plugins_dir()
-    instalar_plugins(forzar=args.reinstalar_plugins)
+    if not preparar_servidor(args):
+        return 1
 
     servidor_proc = None
     tunel_proc = None
@@ -1217,17 +1792,12 @@ def main():
 
         listo_para_subir = True
 
-        # 4. Discord
+        # 4. Discord (siempre: con la IP o con el motivo del fallo)
         webhook = obtener_webhook()
-        if direccion:
-            enviar_a_discord(webhook, (
-                "🎮 **Servidor de Minecraft activo**\n"
-                f"IP: `{direccion}`\n"
-                "Entra con cualquier versión de 1.8 a 1.21: ViaVersion y "
-                "ViaBackwards hacen de traductor."
-            ))
-        elif not args.sin_tunnel:
-            error("Sin QuickTunnel el servidor no es accesible desde Internet.")
+        motivo = MOTIVO_FALLO_TUNEL
+        if args.sin_tunnel:
+            motivo = "QuickTunnel omitido con --sin-tunnel"
+        notificar_servidor(webhook, direccion, args.puerto, motivo)
 
         # 5. Panel final
         print()
@@ -1259,6 +1829,8 @@ def main():
             subir_cambios(
                 f"chore: servidor Minecraft en la raíz local y túnel QuickTunnel ({args.rama})",
                 rama=args.rama,
+                con_respaldo=not args.sin_respaldo,
+                con_jar=not args.respaldo_sin_jar,
             )
         else:
             aviso("El setup no llegó a completarse: no se sube nada a Git para no dejar basura.")
