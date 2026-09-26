@@ -12,7 +12,7 @@ Script de despliegue para servidor de Minecraft Paper en Codespaces.
   El servidor admite de la 1.10 hasta la última versión: ViaVersion y
   ViaBackwards mantienen el rango actualizado solos.
 - Levanta el servidor y espera a que escuche en el puerto 25565.
-- Expone el puerto con ProxVN (respaldo: QuickTunnel) mostrando una barra de carga.
+- Expone el puerto con ProxVN (único túnel) mostrando una barra de carga.
 - Envía la dirección pública a un webhook de Discord.
 - Al terminar, sube los cambios a la rama principal del repositorio.
 
@@ -29,10 +29,10 @@ respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con
 sha256). Ese archivo SÍ se versiona a propósito: es lo que permite importar
 el mundo en otra máquina.
 
-Túnel: ProxVN (cliente oficial, SHA256 verificado) da una IP con puerto
-asignado; si no se puede alcanzar su servidor, se cae a QuickTunnel
-(localhost.run, clave propia en ~/.ssh/quicktunnel_mc). Ambos binarios y la
-clave viven fuera del repositorio.
+Túnel: ProxVN en modo TCP (cliente oficial, SHA256 verificado), que asigna
+una IP:puerto pública. Es el único servicio de túnel que usa el script: si su
+servidor comunitario no está accesible, el script lo dice claramente y avisa
+por Discord, sin recurrir a ningún otro proveedor.
 """
 
 import argparse
@@ -89,24 +89,18 @@ MANIFIESTO = "manifest.json"
 PAPER_API = "https://fill.papermc.io/v3/projects/paper"
 USER_AGENT = "CodeSpace-MC-Setup/1.0 (contact: tu@email.com)"
 
-QUICKTUNNEL_HOST = "localhost.run"
-QUICKTUNNEL_USUARIO = "nokey"
-QUICKTUNNEL_ALTERNATIVOS = ["localhost.run", "t.tn3w.dev"]
-CLAVE_TUNEL = Path.home() / ".ssh" / "quicktunnel_mc"
-
-# ProxVN: cliente oficial en Go. Se descarga de su GitHub y se verifica con el
-# SHA256 publicado. Vive fuera del repositorio, como la clave SSH.
+# ProxVN: único servicio de túnel. Cliente oficial en Go, descargado de su
+# GitHub y verificado con el SHA256 publicado. Vive fuera del repositorio.
 PROXVN_REPO = "hoangtuvungcao/proxvn_tunnel_full"
 PROXVN_DIR = Path.home() / ".local" / "share" / "proxvn"
 PROXVN_BIN = PROXVN_DIR / "proxvn"
 PROXVN_SERVIDOR = "103.77.246.196:8882"
 PROXVN_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
-TUNELES = ("proxvn", "quicktunnel")
 PUERTO_MC = 25565
 PUERTO_TUNEL = 80
 MEMORIA_INICIAL = "1G"
 MEMORIA_MAXIMA = "2G"
-TIMEOUT_TUNEL = 45
+TIMEOUT_TUNEL = 60
 TIMEOUT_ARRANQUE = 240
 INTERVALO_AVISO_TUNEL = 10
 MOTIVO_FALLO_TUNEL = ""
@@ -116,18 +110,12 @@ FIN_GITIGNORE = "# <<< FIN bloque gestionado por setup_mc.py <<<"
 
 RE_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 RE_VERSION_ESTABLE = re.compile(r"^\d+\.\d+(\.\d+)?$")
-SUFIJOS_TUNEL = ("lhr.life", "localhost.run", "sslip.io", "tn3w.dev", "lhr.me")
-RE_URL_TUNEL = re.compile(
-    r"https?://([A-Za-z0-9][A-Za-z0-9.-]*\.(?:" +
-    "|".join(re.escape(s) for s in SUFIJOS_TUNEL) + r"))", re.IGNORECASE)
-RE_URL_CUALQUIERA = re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9-]*\.[A-Za-z]{2,}(?:\.[A-Za-z]{2,})?)")
-RE_TUNEL_MARCADO = re.compile(r"tunneled with tls termination,?\s*(https?://[^\s\"']+)",
-                              re.IGNORECASE)
-# El banner de QuickTunnel contiene enlaces de su web: no son la IP del túnel.
-HOSTS_NO_TUNEL = {"localhost.run", "admin.localhost.run", "docs.localhost.run",
-                  "faq.localhost.run", "status.localhost.run", "blog.localhost.run",
-                  "www.localhost.run", "t.tn3w.dev", "tn3w.dev",
-                  "github.com", "twitter.com", "localhost"}
+# Hosts que aparecen en la salida de ProxVN pero no sirven para entrar al juego.
+HOSTS_NO_TUNEL = {"localhost", "bacsycay.click", "www.bacsycay.click",
+                  "github.com", "www.github.com", "twitter.com",
+                  "maxmind.com", "www.maxmind.com", "dev.maxmind.com",
+                  "papermc.io", "www.papermc.io", "fill.papermc.io",
+                  "docs.gitlab.com", "gitlab.com"}
 
 # Rutas que nunca deben entrar en un commit
 PATRON_SENSIBLE = re.compile(
@@ -305,10 +293,6 @@ def comprobar_java() -> str:
     if version < 21:
         aviso(f"Java {version} es antiguo; Paper 1.21+ pide Java 21 o superior.")
     return str(version)
-
-
-def comprobar_ssh() -> bool:
-    return shutil.which("ssh") is not None
 
 
 # ─── 1. Detectar si ya existe el servidor ─────────────────────────────────
@@ -1070,7 +1054,90 @@ def seguir_servidor(proc, cola: queue.Queue):
     aviso("El servidor se ha detenido.")
 
 
-# ─── 9. ProxVN: túnel TCP (principal) ─────────────────────────────────────
+BARRA_DISCORD = "▓▓▓▓▓▓▓░░░"
+
+
+def _barra_texto(frac: float) -> str:
+    llenos = int(len(BARRA_DISCORD) * frac)
+    return BARRA_DISCORD[:llenos] + BARRA_DISCORD[llenos:]
+
+class NotificadorTunel:
+    """Un único mensaje en Discord: 'Iniciando Túnel' + barra, editado cada 10s.
+
+    Se edita el mismo mensaje (PATCH) en vez de enviar uno nuevo cada vez, así el
+    canal no se llena y solo hay una petición cada 10 segundos.
+    """
+
+    def __init__(self, webhook: str, intervalo: int = INTERVALO_AVISO_TUNEL):
+        self.webhook = webhook
+        self.intervalo = intervalo
+        self.id_mensaje = None
+        self.ultimo_envio = 0.0
+
+    def _url_mensaje(self) -> str:
+        return f"{self.webhook}/messages/{self.id_mensaje}"
+
+    def _enviar(self, contenido: str) -> bool:
+        if not self.webhook:
+            return False
+        try:
+            if self.id_mensaje:
+                r = requests.patch(self._url_mensaje(), json={"content": contenido},
+                                   timeout=20)
+                if r.status_code == 404:
+                    # El mensaje ya no existe (cancho borrado): se crea otro.
+                    self.id_mensaje = None
+                    r = requests.post(self.webhook, json={"content": contenido}, timeout=20)
+            else:
+                r = requests.post(self.webhook, json={"content": contenido}, timeout=20)
+        except Exception as e:  # noqa: BLE001
+            error(f"No se pudo avisar a Discord del túnel: {e}")
+            return False
+        if r.status_code in (200, 201, 204):
+            try:
+                datos = r.json()
+                if datos.get("id"):
+                    self.id_mensaje = datos["id"]
+            except ValueError:
+                pass
+            return True
+        if r.status_code == 429:
+            aviso("Discord limita el aviso del túnel (429); se reintentará en la "
+                  "próxima actualización.")
+            return False
+        error(f"Discord rechazó el aviso del túnel: HTTP {r.status_code}")
+        return False
+
+    def iniciar(self, barra: Barra) -> None:
+        if not self.webhook:
+            return
+        self.ultimo_envio = time.time()
+        self._enviar("⏳ **Iniciando Túnel**\nEspere un momento mientras se abre "
+                     "el acceso público al servidor.")
+
+    def pulso(self, barra: Barra) -> None:
+        """Actualiza la barra como mucho cada `intervalo` segundos."""
+        if not self.webhook or self.id_mensaje is None:
+            return
+        ahora = time.time()
+        if ahora - self.ultimo_envio < self.intervalo:
+            return
+        self.ultimo_envio = ahora
+        pct, frac = barra._avance()
+        transcurrido = ahora - barra.inicio
+        restante = max(0, (barra.limite or 0) - transcurrido)
+        self._enviar(f"⏳ **Iniciando Túnel**\n`{_barra_texto(frac)}` {pct:.0f}% · "
+                     f"{transcurrido:.0f}s · ~{restante:.0f}s restantes")
+
+    def finalizar(self, ip: str = "", motivo: str = "") -> None:
+        if not self.webhook or self.id_mensaje is None:
+            return
+        if ip:
+            self._enviar("✅ **Túnel listo**\n\n" + bloque_ip(ip, "IP pública"))
+        else:
+            self._enviar(f"❌ **No se pudo abrir el túnel**\n{motivo}")
+
+# ─── 9. ProxVN: instalación, parser y lanzadores ───────────────────────────
 RE_PROXVN_DIR = re.compile(
     r"(?:public\s*(?:address|url|endpoint|ip|server)\s*[:=]\s*"
     r"|địa\s*chỉ\s*(?:công\s*cộng|public)?\s*[:=]\s*"
@@ -1164,6 +1231,14 @@ def _direccion_valida(host: str, puerto: str) -> bool:
     return True
 
 
+def _host_valido(host: str) -> bool:
+    if not host or host.lower() in HOSTS_NO_TUNEL:
+        return False
+    etiquetas = host.lower().split(".")
+    if any(e in ("admin", "docs", "faq", "status", "blog", "www") for e in etiquetas[:-1]):
+        return False
+    return len(etiquetas) >= 3
+
 def buscar_direccion_proxvn(texto: str) -> str:
     """Saca la dirección pública del cliente ProxVN.
 
@@ -1199,6 +1274,30 @@ def cmd_proxvn(puerto: int, binario: Path = None) -> list:
     if shutil.which("stdbuf"):
         return ["stdbuf", "-oL", "-eL", *base]
     return base
+
+
+def _servidor_proxvn_alcanzable() -> bool:
+    """Comprueba por TCP si se puede hablar con el servidor público de ProxVN."""
+    host, _, puerto = PROXVN_SERVIDOR.partition(":")
+    try:
+        with socket.create_connection((host, int(puerto or 8882)), timeout=8):
+            return True
+    except OSError:
+        return False
+
+
+def _diagnostico_proxvn(caso: str, timeout: int) -> str:
+    """Explica por qué falló ProxVN, con una comprobación real de red."""
+    if _servidor_proxvn_alcanzable():
+        return (f"el servidor {PROXVN_SERVIDOR} responde pero {caso}. "
+                f"Prueba a mano:  {PROXVN_BIN} --proto tcp --port 25565")
+    return (f"no hay conexión TCP con el servidor público de ProxVN "
+            f"({PROXVN_SERVIDOR}) y {caso}.\n"
+            f"    Compruébalo con:  nc -vz {PROXVN_SERVIDOR.partition(':')[0]} "
+            f"{PROXVN_SERVIDOR.partition(':')[2]}\n"
+            f"    Es un servidor comunitario único y sin respaldo: si está caído o tu "
+            f"firewall bloquea el 8882, no hay túnel. La única alternativa es "
+            f"autohospedar ProxVN en un VPS propio.")
 
 
 def iniciar_tunel_proxvn(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL,
@@ -1253,12 +1352,10 @@ def iniciar_tunel_proxvn(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL,
         if notificador:
             notificador.finalizar(motivo="ProxVN no dio dirección pública")
         if terminado:
-            MOTIVO_FALLO_TUNEL = (f"el cliente de ProxVN terminó sin imprimir dirección "
-                                  f"(¿puedes alcanzar {PROXVN_SERVIDOR}? es un servidor "
-                                  f"comunitario, puede estar caído o bloqueado)")
+            MOTIVO_FALLO_TUNEL = _diagnostico_proxvn("el cliente terminó sin imprimir dirección",
+                                                    timeout)
         else:
-            MOTIVO_FALLO_TUNEL = (f"ProxVN no respondió en {timeout}s "
-                                  f"(¿puedes alcanzar {PROXVN_SERVIDOR}?)")
+            MOTIVO_FALLO_TUNEL = _diagnostico_proxvn(f"no respondió en {timeout}s", timeout)
         error(f"Fallo de ProxVN: {MOTIVO_FALLO_TUNEL}")
         _detener_proceso(proc, escribir_stop=False, timeout=5)
         return "", None
@@ -1310,9 +1407,9 @@ def iniciar_tunel_proxvn_detached(puerto: int, timeout: int = TIMEOUT_TUNEL,
                 notificador.pulso(barra)
             time.sleep(0.2)
         barra.finalizar()
-        MOTIVO_FALLO_TUNEL = f"ProxVN no respondió en {timeout}s (¿salida a {PROXVN_SERVIDOR}?)"
+        MOTIVO_FALLO_TUNEL = _diagnostico_proxvn(f"no respondió en {timeout}s", timeout)
         if notificador:
-            notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL)
+            notificador.finalizar(motivo="ProxVN no dio dirección pública")
         error(f"No se obtuvo la dirección de ProxVN: {MOTIVO_FALLO_TUNEL}")
         _matar_pid(proc.pid)
         _limpiar_pid(PID_TUNEL)
@@ -1321,230 +1418,7 @@ def iniciar_tunel_proxvn_detached(puerto: int, timeout: int = TIMEOUT_TUNEL,
         barra.finalizar()
 
 
-# ─── 10. QuickTunnel por ssh (respaldo) ──────────────────────────────────────
-BARRA_DISCORD = "▓▓▓▓▓▓▓░░░"
-
-
-def _barra_texto(frac: float) -> str:
-    llenos = int(len(BARRA_DISCORD) * frac)
-    return BARRA_DISCORD[:llenos] + BARRA_DISCORD[llenos:]
-
-
-class NotificadorTunel:
-    """Un único mensaje en Discord: 'Iniciando Túnel' + barra, editado cada 10s.
-
-    Se edita el mismo mensaje (PATCH) en vez de enviar uno nuevo cada vez, así el
-    canal no se llena y solo hay una petición cada 10 segundos.
-    """
-
-    def __init__(self, webhook: str, intervalo: int = INTERVALO_AVISO_TUNEL):
-        self.webhook = webhook
-        self.intervalo = intervalo
-        self.id_mensaje = None
-        self.ultimo_envio = 0.0
-
-    def _url_mensaje(self) -> str:
-        return f"{self.webhook}/messages/{self.id_mensaje}"
-
-    def _enviar(self, contenido: str) -> bool:
-        if not self.webhook:
-            return False
-        try:
-            if self.id_mensaje:
-                r = requests.patch(self._url_mensaje(), json={"content": contenido},
-                                   timeout=20)
-                if r.status_code == 404:
-                    # El mensaje ya no existe (cancho borrado): se crea otro.
-                    self.id_mensaje = None
-                    r = requests.post(self.webhook, json={"content": contenido}, timeout=20)
-            else:
-                r = requests.post(self.webhook, json={"content": contenido}, timeout=20)
-        except Exception as e:  # noqa: BLE001
-            error(f"No se pudo avisar a Discord del túnel: {e}")
-            return False
-        if r.status_code in (200, 201, 204):
-            try:
-                datos = r.json()
-                if datos.get("id"):
-                    self.id_mensaje = datos["id"]
-            except ValueError:
-                pass
-            return True
-        if r.status_code == 429:
-            aviso("Discord limita el aviso del túnel (429); se reintentará en la "
-                  "próxima actualización.")
-            return False
-        error(f"Discord rechazó el aviso del túnel: HTTP {r.status_code}")
-        return False
-
-    def iniciar(self, barra: Barra) -> None:
-        if not self.webhook:
-            return
-        self.ultimo_envio = time.time()
-        self._enviar("⏳ **Iniciando Túnel**\nEspere un momento mientras se abre "
-                     "el acceso público al servidor.")
-
-    def pulso(self, barra: Barra) -> None:
-        """Actualiza la barra como mucho cada `intervalo` segundos."""
-        if not self.webhook or self.id_mensaje is None:
-            return
-        ahora = time.time()
-        if ahora - self.ultimo_envio < self.intervalo:
-            return
-        self.ultimo_envio = ahora
-        pct, frac = barra._avance()
-        transcurrido = ahora - barra.inicio
-        restante = max(0, (barra.limite or 0) - transcurrido)
-        self._enviar(f"⏳ **Iniciando Túnel**\n`{_barra_texto(frac)}` {pct:.0f}% · "
-                     f"{transcurrido:.0f}s · ~{restante:.0f}s restantes")
-
-    def finalizar(self, ip: str = "", motivo: str = "") -> None:
-        if not self.webhook or self.id_mensaje is None:
-            return
-        if ip:
-            self._enviar("✅ **Túnel listo**\n\n" + bloque_ip(ip, "IP pública"))
-        else:
-            self._enviar(f"❌ **No se pudo abrir el túnel**\n{motivo}")
-
-
-def asegurar_clave_tunel() -> Path | None:
-    """QuickTunnel exige una clave SSH. Se genera en ~/.ssh (fuera del repo)."""
-    if CLAVE_TUNEL.is_file():
-        try:
-            CLAVE_TUNEL.chmod(0o600)
-        except OSError:
-            pass
-        return CLAVE_TUNEL
-    if not shutil.which("ssh-keygen"):
-        error("Falta ssh-keygen: no se puede crear la clave que exige QuickTunnel.")
-        return None
-    CLAVE_TUNEL.parent.mkdir(parents=True, exist_ok=True)
-    log(f"Generando una clave SSH para QuickTunnel en {CLAVE_TUNEL}...")
-    r = subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "quicktunnel-mc", "-f", str(CLAVE_TUNEL)],
-        capture_output=True, text=True, timeout=60,
-    )
-    if r.returncode != 0 or not CLAVE_TUNEL.is_file():
-        error(f"No se pudo generar la clave: {(r.stderr or '').strip()}")
-        return None
-    try:
-        CLAVE_TUNEL.chmod(0o600)
-    except OSError:
-        pass
-    ok("Clave creada (queda fuera del repositorio, en tu carpeta personal).")
-    return CLAVE_TUNEL
-
-
-def cmd_ssh(puerto: int, host: str = None, clave: Path = None) -> list:
-    """Comando de QuickTunnel: redirige el puerto remoto al local.
-
-    Sin -N a propósito: la URL pública llega por la sesión de shell del servidor,
-    y con -N nunca se recibe. -T evita la pseudo-terminal (salida sin ANSI).
-    """
-    return [
-        "ssh", "-T",
-        "-i", str(clave or CLAVE_TUNEL),
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ExitOnForwardFailure=yes",
-        "-o", "ServerAliveInterval=30",
-        "-o", "ServerAliveCountMax=3",
-        "-R", f"{PUERTO_TUNEL}:localhost:{puerto}",
-        f"{QUICKTUNNEL_USUARIO}@{host or QUICKTUNNEL_HOST}",
-    ]
-
-
-def _host_valido(host: str) -> bool:
-    if not host or host.lower() in HOSTS_NO_TUNEL:
-        return False
-    etiquetas = host.lower().split(".")
-    if any(e in ("admin", "docs", "faq", "status", "blog", "www") for e in etiquetas[:-1]):
-        return False
-    return len(etiquetas) >= 3
-
-
-def buscar_url(texto: str) -> str:
-    """Extrae el host público del túnel de una línea de salida de ssh."""
-    m = RE_TUNEL_MARCADO.search(texto)
-    if m:
-        host = re.sub(r"^https?://", "", m.group(1)).split("/")[0]
-        if _host_valido(host):
-            return host
-    for patron in (RE_URL_TUNEL, RE_URL_CUALQUIERA):
-        for candidato in patron.findall(texto):
-            if _host_valido(candidato):
-                return candidato
-    return ""
-
-
-def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL,
-                        notificador=None) -> tuple:
-    """Lanza QuickTunnel vía SSH y devuelve (direccion_mc, proceso).
-
-    Muestra una barra de carga mientras espera la URL pública.
-    """
-    if not comprobar_ssh():
-        error("No se encontró 'ssh' en el PATH. Instala openssh-client para usar QuickTunnel.")
-        return "", None
-    clave = asegurar_clave_tunel()
-    if clave is None:
-        return "", None
-    cmd = cmd_ssh(puerto, clave=clave)
-    cola: queue.Queue = queue.Queue()
-    try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
-    except FileNotFoundError:
-        error("No se pudo ejecutar ssh.")
-        return "", None
-    threading.Thread(target=_bombeo_salida, args=(proc, cola), daemon=True).start()
-    barra = Barra(f"Levantando QuickTunnel ({QUICKTUNNEL_HOST})", limite=timeout)
-    if notificador:
-        notificador.iniciar(barra)
-    host_publico = None
-    terminado = False
-    try:
-        while time.time() - barra.inicio < timeout:
-            if proc.poll() is not None:
-                terminado = True
-                break
-            try:
-                linea = cola.get(timeout=0.1)
-            except queue.Empty:
-                barra.refrescar()
-                if notificador:
-                    notificador.pulso(barra)
-                continue
-            if linea is None:
-                terminado = True
-                break
-            texto = _sin_ansi(linea).strip()
-            if texto:
-                limpiar_linea()
-                print(f"    {texto}")
-            host_publico = buscar_url(texto)
-            if host_publico:
-                break
-        _drenar(cola)
-    finally:
-        barra.finalizar("QuickTunnel activo" if host_publico else None)
-    if not host_publico:
-        global MOTIVO_FALLO_TUNEL
-        if terminado:
-            MOTIVO_FALLO_TUNEL = ("ssh no llegó a dar la URL "
-                                  f"(¿salida al puerto 22 de {QUICKTUNNEL_HOST}?)")
-        else:
-            MOTIVO_FALLO_TUNEL = f"no respondió en {timeout}s"
-        if notificador:
-            notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL)
-        error(f"No se obtuvo la URL de QuickTunnel: {MOTIVO_FALLO_TUNEL}")
-        _detener_proceso(proc, escribir_stop=False, timeout=5)
-        return "", None
-    direccion_mc = f"{host_publico}:{PUERTO_TUNEL}"
-    if notificador:
-        notificador.finalizar(ip=direccion_mc)
-    ok(f"Dirección para Minecraft: {direccion_mc}")
-    return direccion_mc, proc
+# ─── 10. Utilidades del túnel ─────────────────────────────────────────────
 
 
 def comprobar_tunel(host: str, puerto: int = PUERTO_TUNEL) -> bool:
@@ -1563,134 +1437,55 @@ def detener_tunel(proc):
     _detener_proceso(proc, escribir_stop=False, timeout=8)
 
 
-# ─── 12. Elección de túnel (ProxVN con respaldo) ───────────────────────
-
+# ─── 11. Apertura y verificación del túnel ────────────────────────────────
 def _listo_para_verificar(host_puerto: str) -> bool:
-
-    host = host_puerto.rsplit(":", 1)[0]
-
-    puerto = int(host_puerto.rsplit(":", 1)[1]) if ":" in host_puerto else PUERTO_TUNEL
-
-    return comprobar_tunel(host, puerto)
-
-
+    """Comprueba que la dirección pública realmente acepta conexiones."""
+    if ":" in host_puerto:
+        host, _, puerto = host_puerto.rpartition(":")
+    else:
+        host, puerto = host_puerto, str(PUERTO_TUNEL)
+    return comprobar_tunel(host, int(puerto))
 
 
-
-def elegir_tunel(modo: str, puerto: int, notificador=None) -> tuple:
-
-    """Levanta el túnel elegido. Devuelve (direccion, proceso, nombre_usado).
+def _sin_tunel() -> tuple:
+    return "", None
 
 
+def abrir_tunel(puerto: int, notificador=None, timeout: int = TIMEOUT_TUNEL) -> tuple:
+    """Abre el túnel con ProxVN y devuelve (direccion, proceso).
 
-    modo 'auto' prueba ProxVN y, si falla, cae a QuickTunnel (localhost.run)
-
-    para que nunca te quedes sin IP pública.
-
+    Comprueba siempre que la dirección obtenida responde de verdad: así una IP
+    inventada o un puerto equivocado nunca se anuncian como si fueran el
+    servidor.
     """
-
-    global MOTIVO_FALLO_TUNEL
-
-    orden = ("proxvn", "quicktunnel") if modo == "auto" else (modo,)
-
-    if modo not in ("auto", *TUNELES):
-
-        raise RuntimeError(f"Túnel desconocido: {modo}. Usa: auto, {', '.join(TUNELES)}")
-
-    problemas = []
-
-    for nombre in orden:
-
-        MOTIVO_FALLO_TUNEL = ""
-
-        log(f"Abriendo túnel con {nombre}...")
-
-        if nombre == "proxvn":
-
-            direccion, proc = iniciar_tunel_proxvn(puerto, notificador=notificador)
-
-        else:
-
-            direccion, proc = iniciar_quicktunnel(puerto, notificador=notificador)
-
-        if direccion and _listo_para_verificar(direccion):
-
-            ok(f"Túnel {nombre} verificado: {direccion}")
-
-            return direccion, proc, nombre
-
-        if proc is not None:
-
-            _detener_proceso(proc, escribir_stop=False, timeout=5)
-
-        problemas.append(f"{nombre}: {MOTIVO_FALLO_TUNEL or 'no verificado'}")
-
-        if notificador and nombre != orden[-1]:
-
-            notificador.finalizar(motivo=f"{nombre} falló, probando {orden[-1]}")
-
-    error("Ningún túnel pudo abrirse:\n    - " + "\n    - ".join(problemas))
-
-    return "", None, ""
+    direccion, proc = iniciar_tunel_proxvn(puerto, timeout=timeout, notificador=notificador)
+    if direccion and _listo_para_verificar(direccion):
+        ok(f"Túnel ProxVN verificado: {direccion}")
+        return direccion, proc
+    if proc is not None:
+        _detener_proceso(proc, escribir_stop=False, timeout=5)
+    if direccion:
+        error(f"La dirección {direccion} no responde; se descarta el túnel.")
+    return _sin_tunel()
 
 
+def abrir_tunel_detached(puerto: int, notificador=None,
+                         timeout: int = TIMEOUT_TUNEL) -> tuple:
+    """ProxVN desacoplado: el túnel sigue vivo aunque el script termine."""
+    direccion, proc = iniciar_tunel_proxvn_detached(puerto, timeout=timeout,
+                                                    notificador=notificador)
+    if direccion and _listo_para_verificar(direccion):
+        ok(f"Túnel ProxVN verificado: {direccion}")
+        return direccion, proc
+    if proc is not None:
+        _matar_pid(proc.pid)
+    _limpiar_pid(PID_TUNEL)
+    if direccion:
+        error(f"La dirección {direccion} no responde; se descarta el túnel.")
+    return _sin_tunel()
 
 
-
-def elegir_tunel_detached(modo: str, puerto: int, notificador=None) -> tuple:
-    """Igual que iniciar_tunel() pero dejando el proceso vivo tras salir."""
-
-    global MOTIVO_FALLO_TUNEL
-
-    orden = ("proxvn", "quicktunnel") if modo == "auto" else (modo,)
-
-    if modo not in ("auto", *TUNELES):
-
-        raise RuntimeError(f"Túnel desconocido: {modo}. Usa: auto, {', '.join(TUNELES)}")
-
-    problemas = []
-
-    for nombre in orden:
-
-        MOTIVO_FALLO_TUNEL = ""
-
-        log(f"Abriendo túnel con {nombre}...")
-
-        if nombre == "proxvn":
-
-            direccion, proc = iniciar_tunel_proxvn_detached(puerto, notificador=notificador)
-
-        else:
-
-            direccion, proc = iniciar_tunel_detached(puerto, notificador=notificador)
-
-        if direccion and _listo_para_verificar(direccion):
-
-            ok(f"Túnel {nombre} verificado: {direccion}")
-
-            return direccion, proc, nombre
-
-        if proc is not None:
-
-            _matar_pid(proc.pid)
-
-        _limpiar_pid(PID_TUNEL)
-
-        problemas.append(f"{nombre}: {MOTIVO_FALLO_TUNEL or 'no verificado'}")
-
-        if notificador and nombre != orden[-1]:
-
-            notificador.finalizar(motivo=f"{nombre} falló, probando {orden[-1]}")
-
-    error("Ningún túnel pudo abrirse:\n    - " + "\n    - ".join(problemas))
-
-    return "", None, ""
-
-
-
-
-
-# ─── 13. Modo "--solo-notificar": procesos en segundo plano ───────────────
+# ─── 12. Modo "--solo-notificar": procesos en segundo plano ───────────────
 def _leer_pid(ruta: Path):
     try:
         return int(ruta.read_text().strip())
@@ -1741,13 +1536,13 @@ def _abrir_log(ruta: Path):
     return f
 
 
-def url_en_log(ruta: Path) -> str:
-    """Última URL de túnel que aparece en el log de ssh."""
+def direccion_en_log(ruta: Path) -> str:
+    """Última dirección pública de ProxVN que aparece en su log."""
     try:
         texto = _sin_ansi(ruta.read_text(errors="replace"))
     except OSError:
         return ""
-    return buscar_url(texto)
+    return buscar_direccion_proxvn(texto)
 
 
 CODIGO_PUENTE_CONSOLA = """
@@ -1830,64 +1625,6 @@ def arrancar_servidor_detached(puerto: int):
     return proc
 
 
-def iniciar_tunel_detached(puerto: int, timeout: int = TIMEOUT_TUNEL, notificador=None) -> tuple:
-    """QuickTunnel desacoplado. La URL se lee del log porque no hay tubería."""
-    global MOTIVO_FALLO_TUNEL
-    MOTIVO_FALLO_TUNEL = ""
-    clave = asegurar_clave_tunel()
-    if clave is None:
-        raise RuntimeError("QuickTunnel necesita una clave SSH y no se pudo generar.")
-    cmd = cmd_ssh(puerto, clave=clave)
-    if shutil.which("stdbuf"):
-        cmd = ["stdbuf", "-oL", "-eL", *cmd]
-    mango = _abrir_log(LOG_TUNEL)
-    try:
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=mango, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except FileNotFoundError:
-        raise RuntimeError("No se encontró 'ssh' en el PATH.")
-    finally:
-        mango.close()
-    PID_TUNEL.write_text(f"{proc.pid}\n")
-    barra = Barra(f"Levantando QuickTunnel ({QUICKTUNNEL_HOST})", limite=timeout)
-    if notificador:
-        notificador.iniciar(barra)
-    try:
-        while time.time() - barra.inicio < timeout:
-            if proc.poll() is not None:
-                barra.finalizar()
-                detalle = (_sin_ansi(LOG_TUNEL.read_text(errors="replace")).strip()
-                           if LOG_TUNEL.is_file() else "")
-                MOTIVO_FALLO_TUNEL = (detalle[-200:] or "el proceso de ssh murió sin salida")
-                if notificador:
-                    notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL)
-                error(f"QuickTunnel terminó antes de dar la URL:\n{MOTIVO_FALLO_TUNEL}")
-                _limpiar_pid(PID_TUNEL)
-                return "", None
-            host = url_en_log(LOG_TUNEL)
-            if host:
-                barra.finalizar("QuickTunnel activo")
-                if notificador:
-                    notificador.finalizar(ip=f"{host}:{PUERTO_TUNEL}")
-                return f"{host}:{PUERTO_TUNEL}", proc
-            barra.refrescar()
-            if notificador:
-                notificador.pulso(barra)
-            time.sleep(0.2)
-        barra.finalizar()
-        MOTIVO_FALLO_TUNEL = (f"sin respuesta de {QUICKTUNNEL_HOST} en {timeout}s "
-                              f"(¿salida a internet por el puerto 22?)")
-        if notificador:
-            notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL)
-        error(f"No se obtuvo la URL de QuickTunnel: {MOTIVO_FALLO_TUNEL}")
-        _matar_pid(proc.pid)
-        _limpiar_pid(PID_TUNEL)
-        return "", None
-    finally:
-        barra.finalizar()
-
 
 def _parar_anterior(ruta_pid: Path, etiqueta: str) -> bool:
     """Cierra el proceso de una ejecución anterior para no acumular túneles."""
@@ -1899,7 +1636,6 @@ def _parar_anterior(ruta_pid: Path, etiqueta: str) -> bool:
     _matar_pid(pid)
     _limpiar_pid(ruta_pid)
     return True
-
 
 def modo_notificacion(args) -> int:
     """Deja servidor y túnel vivos, avisa a Discord y sube los cambios."""
@@ -1924,26 +1660,20 @@ def modo_notificacion(args) -> int:
     if webhook and not args.sin_notificar_tunel:
         notificador = NotificadorTunel(webhook)
 
-    # 3. Túnel
+    # 3. Túnel ProxVN
     direccion = ""
     pid_tunel = _leer_pid(PID_TUNEL)
     if _vivo(pid_tunel):
-        host = url_en_log(LOG_TUNEL)
-        if host and comprobar_tunel(host):
-            direccion = f"{host}:{PUERTO_TUNEL}"
-            ok(f"QuickTunnel anterior sigue vivo (PID {pid_tunel}): {direccion}")
+        previa = direccion_en_log(LOG_TUNEL)
+        if previa and _listo_para_verificar(previa):
+            direccion = previa
+            ok(f"El túnel ProxVN anterior sigue vivo (PID {pid_tunel}): {direccion}")
     if not direccion:
         _parar_anterior(PID_TUNEL, "túnel")
         if args.sin_tunnel:
             aviso("Túnel omitido (--sin-tunnel): la IP no será pública.")
         else:
-            direccion, _proc, _usado = elegir_tunel_detached(args.tunel, args.puerto,
-                                                              notificador=notificador)
-            if direccion:
-                if comprobar_tunel(direccion.rsplit(":", 1)[0]):
-                    ok("Túnel verificado: el puerto público responde.")
-                else:
-                    aviso("El túnel aún no responde; puede tardar unos segundos más.")
+            direccion, _proc = abrir_tunel_detached(args.puerto, notificador=notificador)
 
     # 4. Aviso con la IP (o con el motivo del fallo)
     notificar_servidor(webhook, direccion, args.puerto, MOTIVO_FALLO_TUNEL)
@@ -1978,9 +1708,7 @@ def modo_notificacion(args) -> int:
                 con_jar=not args.respaldo_sin_jar):
             codigo = 1
     return codigo
-
-
-# ─── 14. Respaldo comprimido e importación ───────────────────────────────
+# ─── 13. Respaldo comprimido e importación ───────────────────────────────
 # Rutas que se empaquetan (relativas a SERVER_DIR); el resto se regenera al importar.
 BACKUP_INCLUYE = ["server.jar", "world", "plugins", "config", ".paper",
                   "server.properties", "eula.txt", "ops.json", "whitelist.json",
@@ -2398,7 +2126,7 @@ def preguntar_url_respaldo() -> str:
         return ""
 
 
-# ─── 15. Commit y push a la rama principal ───────────────────────────────
+# ─── 14. Commit y push a la rama principal ───────────────────────────────
 def subir_cambios(mensaje: str, rama: str = "main", con_respaldo: bool = True,
                   con_jar: bool = True) -> bool:
     """Verifica secretos, crea el respaldo, hace commit y empuja a la rama principal."""
@@ -2466,9 +2194,6 @@ def parse_args():
     p.add_argument("--puerto", type=int, default=PUERTO_MC, help="Puerto del servidor (25565)")
     p.add_argument("--memoria", default=MEMORIA_MAXIMA, help="Memoria máxima, p. ej. 3G")
     p.add_argument("--sin-tunnel", action="store_true", help="No levantar ningún túnel")
-    p.add_argument("--tunel", choices=("auto", *TUNELES), default="auto",
-                   help="Servicio de túnel: proxvn (por defecto), quicktunnel o auto "
-                        "(ProxVN con respaldo a QuickTunnel)")
     p.add_argument("--sin-push", action="store_true", help="No hacer commit/push al final")
     p.add_argument("--sin-respaldo", action="store_true",
                    help="No comprimir el servidor antes de subirlo")
@@ -2593,25 +2318,18 @@ def main():
             raise RuntimeError(f"El servidor no abrió el puerto {args.puerto} a tiempo.")
         configurar_authme()  # la config de AuthMe existe tras el primer arranque
 
-        # 3. Túnel con barra de carga
+        # 3. Túnel ProxVN con barra de carga
         if not args.sin_tunnel:
-            direccion, tunel_proc, _usado = elegir_tunel(args.tunel, args.puerto,
-                                                          notificador=notificador)
-            if direccion:
-                host = direccion.rsplit(":", 1)[0]
-                if comprobar_tunel(host):
-                    ok("Túnel verificado: el puerto público responde.")
-                else:
-                    aviso("El túnel no responde todavía; puede tardar unos segundos más.")
+            direccion, tunel_proc = abrir_tunel(args.puerto, notificador=notificador)
         else:
-            aviso("QuickTunnel omitido (--sin-tunnel).")
+            aviso("Túnel omitido (--sin-tunnel).")
 
         listo_para_subir = True
 
         # 4. Discord (siempre: con la IP o con el motivo del fallo)
         motivo = MOTIVO_FALLO_TUNEL
         if args.sin_tunnel:
-            motivo = "QuickTunnel omitido con --sin-tunnel"
+            motivo = "el túnel se omitió con --sin-tunnel"
         notificar_servidor(webhook, direccion, args.puerto, motivo)
 
         # 5. Panel final
@@ -2648,7 +2366,7 @@ def main():
         elif listo_para_subir:
             titulo("SUBIENDO CAMBIOS A LA RAMA PRINCIPAL")
             subir_cambios(
-                f"chore: servidor Minecraft en la raíz local y túnel QuickTunnel ({args.rama})",
+                f"chore: servidor Minecraft en la raíz local y túnel ProxVN ({args.rama})",
                 rama=args.rama,
                 con_respaldo=not args.sin_respaldo,
                 con_jar=not args.respaldo_sin_jar,
