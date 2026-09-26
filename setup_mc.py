@@ -12,7 +12,7 @@ Script de despliegue para servidor de Minecraft Paper en Codespaces.
   El servidor admite de la 1.10 hasta la última versión: ViaVersion y
   ViaBackwards mantienen el rango actualizado solos.
 - Levanta el servidor y espera a que escuche en el puerto 25565.
-- Expone el puerto con QuickTunnel mostrando una barra de carga.
+- Expone el puerto con ProxVN (respaldo: QuickTunnel) mostrando una barra de carga.
 - Envía la dirección pública a un webhook de Discord.
 - Al terminar, sube los cambios a la rama principal del repositorio.
 
@@ -29,9 +29,10 @@ respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con
 sha256). Ese archivo SÍ se versiona a propósito: es lo que permite importar
 el mundo en otra máquina.
 
-QuickTunnel exige una clave SSH propia: se genera sola la primera vez en
-~/.ssh/quicktunnel_mc (fuera del repositorio) y se usa el host localhost.run
-con el usuario 'nokey'.
+Túnel: ProxVN (cliente oficial, SHA256 verificado) da una IP con puerto
+asignado; si no se puede alcanzar su servidor, se cae a QuickTunnel
+(localhost.run, clave propia en ~/.ssh/quicktunnel_mc). Ambos binarios y la
+clave viven fuera del repositorio.
 """
 
 import argparse
@@ -92,6 +93,15 @@ QUICKTUNNEL_HOST = "localhost.run"
 QUICKTUNNEL_USUARIO = "nokey"
 QUICKTUNNEL_ALTERNATIVOS = ["localhost.run", "t.tn3w.dev"]
 CLAVE_TUNEL = Path.home() / ".ssh" / "quicktunnel_mc"
+
+# ProxVN: cliente oficial en Go. Se descarga de su GitHub y se verifica con el
+# SHA256 publicado. Vive fuera del repositorio, como la clave SSH.
+PROXVN_REPO = "hoangtuvungcao/proxvn_tunnel_full"
+PROXVN_DIR = Path.home() / ".local" / "share" / "proxvn"
+PROXVN_BIN = PROXVN_DIR / "proxvn"
+PROXVN_SERVIDOR = "103.77.246.196:8882"
+PROXVN_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+TUNELES = ("proxvn", "quicktunnel")
 PUERTO_MC = 25565
 PUERTO_TUNEL = 80
 MEMORIA_INICIAL = "1G"
@@ -1060,7 +1070,258 @@ def seguir_servidor(proc, cola: queue.Queue):
     aviso("El servidor se ha detenido.")
 
 
-# ─── 9. QuickTunnel con barra de carga ────────────────────────────────────
+# ─── 9. ProxVN: túnel TCP (principal) ─────────────────────────────────────
+RE_PROXVN_DIR = re.compile(
+    r"(?:public\s*(?:address|url|endpoint|ip|server)\s*[:=]\s*"
+    r"|địa\s*chỉ\s*(?:công\s*cộng|public)?\s*[:=]\s*"
+    r"|forwarding\s*[:=]\s*)([^\s]+)", re.IGNORECASE)
+RE_HOST_PUERTO = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b")
+RE_URL = re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9.-]*)(?::(\d{2,5}))?")
+
+
+def _asset_proxvn_para_arquitectura() -> tuple:
+    arch = PROXVN_ARCH.get(os.uname().machine.lower(), "")
+    if not arch:
+        raise RuntimeError(f"Arquitectura no soportada por ProxVN: {os.uname().machine}")
+    return f"proxvn-linux-{arch}", "SHA256SUMS-client.txt"
+
+
+def instalar_proxvn(forzar: bool = False) -> Path | None:
+    """Descarga el cliente oficial de ProxVN y verifica su SHA256.
+
+    Se guarda en ~/.local/share/proxvn (fuera del repositorio).
+    """
+    if PROXVN_BIN.is_file() and os.access(PROXVN_BIN, os.X_OK) and not forzar:
+        log(f"ProxVN ya instalado ({PROXVN_BIN}).")
+        return PROXVN_BIN
+    nombre_binario, nombre_sumas = _asset_proxvn_para_arquitectura()
+    barra = Barra(f"Descargando {nombre_binario}", total=None)
+    try:
+        headers = {"Accept": "application/vnd.github+json"}
+        rel = requests.get(f"https://api.github.com/repos/{PROXVN_REPO}/releases/latest",
+                           headers=headers, timeout=30)
+        rel.raise_for_status()
+        release = rel.json()
+        assets = {a["name"]: a for a in release.get("assets", [])}
+        if nombre_binario not in assets or nombre_sumas not in assets:
+            raise RuntimeError(f"El release {release.get('tag_name')} no trae {nombre_binario}.")
+        log(f"ProxVN {release.get('tag_name')} (checksum oficial: {nombre_sumas})")
+
+        suma_declarada = ""
+        r = requests.get(assets[nombre_sumas]["browser_download_url"], timeout=60)
+        r.raise_for_status()
+        for linea in r.text.splitlines():
+            partes = linea.split()
+            if len(partes) >= 2 and partes[-1].lstrip("*") == nombre_binario:
+                suma_declarada = partes[0].strip().lower()
+        if not suma_declarada:
+            raise RuntimeError("El archivo de sumas no incluye el binario; "
+                               "no se continúa sin verificación.")
+
+        PROXVN_DIR.mkdir(parents=True, exist_ok=True)
+        temporal = PROXVN_BIN.with_suffix(".descarga")
+        with requests.get(assets[nombre_binario]["browser_download_url"],
+                          stream=True, timeout=300) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length") or 0)
+            barra.total = total or None
+            with open(temporal, "wb") as f:
+                for trozo in resp.iter_content(262144):
+                    if trozo:
+                        f.write(trozo)
+                        if total:
+                            barra.avanzar(len(trozo))
+        barra.finalizar("Descarga completada")
+
+        suma_real = _sha256_archivo(temporal)
+        if suma_real != suma_declarada:
+            temporal.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"El binario no coincide con el SHA256 oficial.\n"
+                f"    esperado: {suma_declarada}\n    obtenido: {suma_real}")
+        ok("SHA256 verificado contra el publicado por el proyecto.")
+        temporal.replace(PROXVN_BIN)
+        PROXVN_BIN.chmod(0o755)
+    except Exception as e:  # noqa: BLE001
+        barra.finalizar()
+        error(f"No se pudo preparar ProxVN: {e}")
+        return None
+    ok(f"ProxVN instalado en {PROXVN_BIN}")
+    return PROXVN_BIN
+
+
+def _es_puerto_del_servidor(puerto: str) -> bool:
+    return puerto == PROXVN_SERVIDOR.rsplit(":", 1)[-1]
+
+
+def _direccion_valida(host: str, puerto: str) -> bool:
+    if not host or host.lower() in HOSTS_NO_TUNEL or host in ("localhost", "0.0.0.0"):
+        return False
+    if host.startswith(("127.", "0.", "10.", "192.168.", "169.254.")):
+        return False
+    if _es_puerto_del_servidor(puerto):
+        return False
+    return True
+
+
+def buscar_direccion_proxvn(texto: str) -> str:
+    """Saca la dirección pública del cliente ProxVN.
+
+    Solo se aceptan las líneas que el propio cliente etiqueta como públicas:
+        Public URL: https://abc123.bacsycay.click      (proto http)
+        Public Address: 103.77.246.196:34567           (proto tcp)
+    A propósito NO se rastrean IPs sueltas: los mensajes de conexión incluyen
+    IPs públicas de salida del cliente (p. ej. "your connection id is
+    20.171.127.65:61960") que no sirven para entrar al servidor.
+    """
+    for linea in texto.splitlines():
+        limpia = _sin_ansi(linea).strip()
+        m = RE_PROXVN_DIR.search(limpia)
+        if not m:
+            continue
+        valor = m.group(1).strip().rstrip(",;")
+        mu = RE_URL.match(valor)
+        if mu and _host_valido(mu.group(1)):
+            puerto = mu.group(2) or str(PUERTO_TUNEL)
+            if _direccion_valida(mu.group(1), puerto):
+                return f"{mu.group(1)}:{puerto}"
+        mh = RE_HOST_PUERTO.search(valor)
+        if mh and _direccion_valida(mh.group(1), mh.group(2)):
+            return f"{mh.group(1)}:{mh.group(2)}"
+    return ""
+
+
+def cmd_proxvn(puerto: int, binario: Path = None) -> list:
+    base = [str(binario or PROXVN_BIN), "--ui=false", "--proto", "tcp",
+            "--host", "localhost", "--port", str(puerto),
+            "--server", PROXVN_SERVIDOR]
+    # El cliente bufferiza la salida: sin esto, la IP no aparece hasta que muere.
+    if shutil.which("stdbuf"):
+        return ["stdbuf", "-oL", "-eL", *base]
+    return base
+
+
+def iniciar_tunel_proxvn(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL,
+                         notificador=None) -> tuple:
+    """Lanza ProxVN (TCP) y devuelve (direccion, proceso)."""
+    global MOTIVO_FALLO_TUNEL
+    MOTIVO_FALLO_TUNEL = ""
+    binario = PROXVN_BIN if PROXVN_BIN.is_file() else instalar_proxvn()
+    if binario is None:
+        return "", None
+    cola: queue.Queue = queue.Queue()
+    try:
+        proc = subprocess.Popen(
+            cmd_proxvn(puerto, binario), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+    except FileNotFoundError:
+        error("No se pudo ejecutar el cliente de ProxVN.")
+        return "", None
+    threading.Thread(target=_bombeo_salida, args=(proc, cola), daemon=True).start()
+    barra = Barra(f"Levantando ProxVN ({PROXVN_SERVIDOR})", limite=timeout)
+    if notificador:
+        notificador.iniciar(barra)
+    direccion = ""
+    terminado = False
+    try:
+        while time.time() - barra.inicio < timeout:
+            if proc.poll() is not None:
+                terminado = True
+                break
+            try:
+                linea = cola.get(timeout=0.2)
+            except queue.Empty:
+                barra.refrescar()
+                if notificador:
+                    notificador.pulso(barra)
+                continue
+            if linea is None:
+                terminado = True
+                break
+            texto = _sin_ansi(linea).rstrip()
+            if texto:
+                limpiar_linea()
+                print(f"    {texto}")
+            direccion = buscar_direccion_proxvn(texto) or direccion
+            if direccion:
+                break
+        _drenar(cola)
+    finally:
+        barra.finalizar("ProxVN activo" if direccion else None)
+    if not direccion:
+        if notificador:
+            notificador.finalizar(motivo="ProxVN no dio dirección pública")
+        if terminado:
+            MOTIVO_FALLO_TUNEL = (f"el cliente de ProxVN terminó sin imprimir dirección "
+                                  f"(¿puedes alcanzar {PROXVN_SERVIDOR}? es un servidor "
+                                  f"comunitario, puede estar caído o bloqueado)")
+        else:
+            MOTIVO_FALLO_TUNEL = (f"ProxVN no respondió en {timeout}s "
+                                  f"(¿puedes alcanzar {PROXVN_SERVIDOR}?)")
+        error(f"Fallo de ProxVN: {MOTIVO_FALLO_TUNEL}")
+        _detener_proceso(proc, escribir_stop=False, timeout=5)
+        return "", None
+    ok(f"Dirección para Minecraft: {direccion}")
+    return direccion, proc
+
+
+def iniciar_tunel_proxvn_detached(puerto: int, timeout: int = TIMEOUT_TUNEL,
+                                  notificador=None) -> tuple:
+    """ProxVN desacoplado: sobrevive a la salida del script."""
+    global MOTIVO_FALLO_TUNEL
+    MOTIVO_FALLO_TUNEL = ""
+    binario = PROXVN_BIN if PROXVN_BIN.is_file() else instalar_proxvn()
+    if binario is None:
+        raise RuntimeError("ProxVN no está disponible.")
+    mango = _abrir_log(LOG_TUNEL)
+    try:
+        proc = subprocess.Popen(
+            cmd_proxvn(puerto, binario), stdin=subprocess.DEVNULL, stdout=mango,
+            stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("No se encontró el cliente de ProxVN.")
+    finally:
+        mango.close()
+    PID_TUNEL.write_text(f"{proc.pid}\n")
+    barra = Barra(f"Levantando ProxVN ({PROXVN_SERVIDOR})", limite=timeout)
+    if notificador:
+        notificador.iniciar(barra)
+    try:
+        while time.time() - barra.inicio < timeout:
+            if proc.poll() is not None:
+                barra.finalizar()
+                if notificador:
+                    notificador.finalizar(motivo="ProxVN terminó sin dar dirección")
+                detalle = _sin_ansi(LOG_TUNEL.read_text(errors="replace")).strip()
+                MOTIVO_FALLO_TUNEL = detalle[-200:] or "el cliente de ProxVN murió sin salida"
+                error(f"ProxVN terminó antes de dar la dirección:\n{MOTIVO_FALLO_TUNEL}")
+                _limpiar_pid(PID_TUNEL)
+                return "", None
+            direccion = buscar_direccion_proxvn(_sin_ansi(LOG_TUNEL.read_text(errors="replace")))
+            if direccion:
+                barra.finalizar("ProxVN activo")
+                if notificador:
+                    notificador.finalizar(ip=direccion)
+                return direccion, proc
+            barra.refrescar()
+            if notificador:
+                notificador.pulso(barra)
+            time.sleep(0.2)
+        barra.finalizar()
+        MOTIVO_FALLO_TUNEL = f"ProxVN no respondió en {timeout}s (¿salida a {PROXVN_SERVIDOR}?)"
+        if notificador:
+            notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL)
+        error(f"No se obtuvo la dirección de ProxVN: {MOTIVO_FALLO_TUNEL}")
+        _matar_pid(proc.pid)
+        _limpiar_pid(PID_TUNEL)
+        return "", None
+    finally:
+        barra.finalizar()
+
+
+# ─── 10. QuickTunnel por ssh (respaldo) ──────────────────────────────────────
 BARRA_DISCORD = "▓▓▓▓▓▓▓░░░"
 
 
@@ -1298,11 +1559,138 @@ def comprobar_tunel(host: str, puerto: int = PUERTO_TUNEL) -> bool:
 def detener_tunel(proc):
     if proc is None or proc.poll() is not None:
         return
-    log("Cerrando QuickTunnel...")
+    log("Cerrando el túnel...")
     _detener_proceso(proc, escribir_stop=False, timeout=8)
 
 
-# ─── 10. Modo "--solo-notificar": procesos en segundo plano ───────────────
+# ─── 12. Elección de túnel (ProxVN con respaldo) ───────────────────────
+
+def _listo_para_verificar(host_puerto: str) -> bool:
+
+    host = host_puerto.rsplit(":", 1)[0]
+
+    puerto = int(host_puerto.rsplit(":", 1)[1]) if ":" in host_puerto else PUERTO_TUNEL
+
+    return comprobar_tunel(host, puerto)
+
+
+
+
+
+def elegir_tunel(modo: str, puerto: int, notificador=None) -> tuple:
+
+    """Levanta el túnel elegido. Devuelve (direccion, proceso, nombre_usado).
+
+
+
+    modo 'auto' prueba ProxVN y, si falla, cae a QuickTunnel (localhost.run)
+
+    para que nunca te quedes sin IP pública.
+
+    """
+
+    global MOTIVO_FALLO_TUNEL
+
+    orden = ("proxvn", "quicktunnel") if modo == "auto" else (modo,)
+
+    if modo not in ("auto", *TUNELES):
+
+        raise RuntimeError(f"Túnel desconocido: {modo}. Usa: auto, {', '.join(TUNELES)}")
+
+    problemas = []
+
+    for nombre in orden:
+
+        MOTIVO_FALLO_TUNEL = ""
+
+        log(f"Abriendo túnel con {nombre}...")
+
+        if nombre == "proxvn":
+
+            direccion, proc = iniciar_tunel_proxvn(puerto, notificador=notificador)
+
+        else:
+
+            direccion, proc = iniciar_quicktunnel(puerto, notificador=notificador)
+
+        if direccion and _listo_para_verificar(direccion):
+
+            ok(f"Túnel {nombre} verificado: {direccion}")
+
+            return direccion, proc, nombre
+
+        if proc is not None:
+
+            _detener_proceso(proc, escribir_stop=False, timeout=5)
+
+        problemas.append(f"{nombre}: {MOTIVO_FALLO_TUNEL or 'no verificado'}")
+
+        if notificador and nombre != orden[-1]:
+
+            notificador.finalizar(motivo=f"{nombre} falló, probando {orden[-1]}")
+
+    error("Ningún túnel pudo abrirse:\n    - " + "\n    - ".join(problemas))
+
+    return "", None, ""
+
+
+
+
+
+def elegir_tunel_detached(modo: str, puerto: int, notificador=None) -> tuple:
+    """Igual que iniciar_tunel() pero dejando el proceso vivo tras salir."""
+
+    global MOTIVO_FALLO_TUNEL
+
+    orden = ("proxvn", "quicktunnel") if modo == "auto" else (modo,)
+
+    if modo not in ("auto", *TUNELES):
+
+        raise RuntimeError(f"Túnel desconocido: {modo}. Usa: auto, {', '.join(TUNELES)}")
+
+    problemas = []
+
+    for nombre in orden:
+
+        MOTIVO_FALLO_TUNEL = ""
+
+        log(f"Abriendo túnel con {nombre}...")
+
+        if nombre == "proxvn":
+
+            direccion, proc = iniciar_tunel_proxvn_detached(puerto, notificador=notificador)
+
+        else:
+
+            direccion, proc = iniciar_tunel_detached(puerto, notificador=notificador)
+
+        if direccion and _listo_para_verificar(direccion):
+
+            ok(f"Túnel {nombre} verificado: {direccion}")
+
+            return direccion, proc, nombre
+
+        if proc is not None:
+
+            _matar_pid(proc.pid)
+
+        _limpiar_pid(PID_TUNEL)
+
+        problemas.append(f"{nombre}: {MOTIVO_FALLO_TUNEL or 'no verificado'}")
+
+        if notificador and nombre != orden[-1]:
+
+            notificador.finalizar(motivo=f"{nombre} falló, probando {orden[-1]}")
+
+    error("Ningún túnel pudo abrirse:\n    - " + "\n    - ".join(problemas))
+
+    return "", None, ""
+
+
+
+
+
+# ─── 13. Modo "--solo-notificar": procesos en segundo plano ───────────────
 def _leer_pid(ruta: Path):
     try:
         return int(ruta.read_text().strip())
@@ -1547,9 +1935,10 @@ def modo_notificacion(args) -> int:
     if not direccion:
         _parar_anterior(PID_TUNEL, "túnel")
         if args.sin_tunnel:
-            aviso("QuickTunnel omitido (--sin-tunnel): la IP no será pública.")
+            aviso("Túnel omitido (--sin-tunnel): la IP no será pública.")
         else:
-            direccion, _proc = iniciar_tunel_detached(args.puerto, notificador=notificador)
+            direccion, _proc, _usado = elegir_tunel_detached(args.tunel, args.puerto,
+                                                              notificador=notificador)
             if direccion:
                 if comprobar_tunel(direccion.rsplit(":", 1)[0]):
                     ok("Túnel verificado: el puerto público responde.")
@@ -1591,7 +1980,7 @@ def modo_notificacion(args) -> int:
     return codigo
 
 
-# ─── 11. Respaldo comprimido e importación ───────────────────────────────
+# ─── 14. Respaldo comprimido e importación ───────────────────────────────
 # Rutas que se empaquetan (relativas a SERVER_DIR); el resto se regenera al importar.
 BACKUP_INCLUYE = ["server.jar", "world", "plugins", "config", ".paper",
                   "server.properties", "eula.txt", "ops.json", "whitelist.json",
@@ -2009,7 +2398,7 @@ def preguntar_url_respaldo() -> str:
         return ""
 
 
-# ─── 12. Commit y push a la rama principal ───────────────────────────────
+# ─── 15. Commit y push a la rama principal ───────────────────────────────
 def subir_cambios(mensaje: str, rama: str = "main", con_respaldo: bool = True,
                   con_jar: bool = True) -> bool:
     """Verifica secretos, crea el respaldo, hace commit y empuja a la rama principal."""
@@ -2073,10 +2462,13 @@ def _al_interrumpir(signum, frame):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Servidor de Minecraft Paper + QuickTunnel")
+    p = argparse.ArgumentParser(description="Servidor de Minecraft Paper + túnel ProxVN")
     p.add_argument("--puerto", type=int, default=PUERTO_MC, help="Puerto del servidor (25565)")
     p.add_argument("--memoria", default=MEMORIA_MAXIMA, help="Memoria máxima, p. ej. 3G")
-    p.add_argument("--sin-tunnel", action="store_true", help="No levantar QuickTunnel")
+    p.add_argument("--sin-tunnel", action="store_true", help="No levantar ningún túnel")
+    p.add_argument("--tunel", choices=("auto", *TUNELES), default="auto",
+                   help="Servicio de túnel: proxvn (por defecto), quicktunnel o auto "
+                        "(ProxVN con respaldo a QuickTunnel)")
     p.add_argument("--sin-push", action="store_true", help="No hacer commit/push al final")
     p.add_argument("--sin-respaldo", action="store_true",
                    help="No comprimir el servidor antes de subirlo")
@@ -2145,7 +2537,7 @@ def main():
     except (ValueError, OSError):
         pass
 
-    titulo("SETUP SERVIDOR MINECRAFT PAPER + QUICKTUNNEL")
+    titulo("SETUP SERVIDOR MINECRAFT PAPER + TÚNEL PÚBLICO")
     log(f"Directorio del servidor (raíz local): {SERVER_DIR}")
     log(f"JAR del servidor: {SERVER_JAR}")
 
@@ -2203,7 +2595,8 @@ def main():
 
         # 3. Túnel con barra de carga
         if not args.sin_tunnel:
-            direccion, tunel_proc = iniciar_quicktunnel(args.puerto, notificador=notificador)
+            direccion, tunel_proc, _usado = elegir_tunel(args.tunel, args.puerto,
+                                                          notificador=notificador)
             if direccion:
                 host = direccion.rsplit(":", 1)[0]
                 if comprobar_tunel(host):
