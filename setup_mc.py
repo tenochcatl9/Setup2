@@ -1266,59 +1266,82 @@ def buscar_direccion_proxvn(texto: str) -> str:
     return ""
 
 
-def cmd_proxvn(puerto: int, binario: Path = None) -> list:
+def _servidor_proxvn_alcanzable(servidor: str = None, timeout: int = 6) -> bool:
+    """Comprueba por TCP si se puede hablar con el servidor de túneles de ProxVN."""
+    host, _, puerto = (servidor or PROXVN_SERVIDOR).partition(":")
+    try:
+        with socket.create_connection((host, int(puerto or 8882)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _diagnostico_proxvn(caso: str, servidor: str = None) -> str:
+    """Explica por qué falló ProxVN, con una comprobación real de red."""
+    servidor = servidor or PROXVN_SERVIDOR
+    host, _, puerto = servidor.partition(":")
+    if _servidor_proxvn_alcanzable(servidor):
+        return (f"el servidor {servidor} sí responde desde esta máquina, pero {caso}. "
+                f"Prueba a mano:  {PROXVN_BIN} --proto tcp --port 25565")
+    return (f"esta máquina no consigue abrir una conexión TCP con el servidor de "
+            f"túneles {servidor} y, además, {caso}.\n"
+            f"    Compruébalo con:  nc -vz {host} {puerto or '8882'}\n"
+            f"    Ojo: ProxVN usa un único servidor comunitario. Que esté encendido no "
+            f"basta: si tu red o tu proveedor bloquean esa IP:puerto, no hay túnel.\n"
+            f"    Opciones:  (1) ejecutar desde una red que lo permita, "
+            f"(2) permitir la salida a {host}:{puerto or '8882'}, "
+            f"(3) autohospedar ProxVN en un VPS propio y usar "
+            f"--tunel-servidor TUDIRECCION:{puerto or '8882'}")
+
+
+def cmd_proxvn(puerto: int, binario: Path = None, servidor: str = None) -> list:
     base = [str(binario or PROXVN_BIN), "--ui=false", "--proto", "tcp",
             "--host", "localhost", "--port", str(puerto),
-            "--server", PROXVN_SERVIDOR]
+            "--server", servidor or PROXVN_SERVIDOR]
     # El cliente bufferiza la salida: sin esto, la IP no aparece hasta que muere.
     if shutil.which("stdbuf"):
         return ["stdbuf", "-oL", "-eL", *base]
     return base
 
 
-def _servidor_proxvn_alcanzable() -> bool:
-    """Comprueba por TCP si se puede hablar con el servidor público de ProxVN."""
-    host, _, puerto = PROXVN_SERVIDOR.partition(":")
-    try:
-        with socket.create_connection((host, int(puerto or 8882)), timeout=8):
-            return True
-    except OSError:
-        return False
+def _prechequear_servidor_proxvn(servidor: str, notificador=None) -> bool:
+    """Falla rápido si el servidor de túneles no es alcanzable desde aquí.
 
-
-def _diagnostico_proxvn(caso: str, timeout: int) -> str:
-    """Explica por qué falló ProxVN, con una comprobación real de red."""
-    if _servidor_proxvn_alcanzable():
-        return (f"el servidor {PROXVN_SERVIDOR} responde pero {caso}. "
-                f"Prueba a mano:  {PROXVN_BIN} --proto tcp --port 25565")
-    return (f"no hay conexión TCP con el servidor público de ProxVN "
-            f"({PROXVN_SERVIDOR}) y {caso}.\n"
-            f"    Compruébalo con:  nc -vz {PROXVN_SERVIDOR.partition(':')[0]} "
-            f"{PROXVN_SERVIDOR.partition(':')[2]}\n"
-            f"    Es un servidor comunitario único y sin respaldo: si está caído o tu "
-            f"firewall bloquea el 8882, no hay túnel. La única alternativa es "
-            f"autohospedar ProxVN en un VPS propio.")
+    Evita esperar el timeout entero cuando el problema es de red: se comprueba
+    en unos segundos y el motivo queda claro.
+    """
+    global MOTIVO_FALLO_TUNEL
+    if _servidor_proxvn_alcanzable(servidor):
+        return True
+    MOTIVO_FALLO_TUNEL = _diagnostico_proxvn("el cliente no llegó a conectar", servidor)
+    if notificador:
+        notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL.splitlines()[0])
+    error(f"No se abre túnel ProxVN: {MOTIVO_FALLO_TUNEL}")
+    return False
 
 
 def iniciar_tunel_proxvn(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL,
-                         notificador=None) -> tuple:
+                         notificador=None, servidor: str = None) -> tuple:
     """Lanza ProxVN (TCP) y devuelve (direccion, proceso)."""
     global MOTIVO_FALLO_TUNEL
     MOTIVO_FALLO_TUNEL = ""
+    servidor = servidor or PROXVN_SERVIDOR
+    if not _prechequear_servidor_proxvn(servidor, notificador):
+        return "", None
     binario = PROXVN_BIN if PROXVN_BIN.is_file() else instalar_proxvn()
     if binario is None:
         return "", None
     cola: queue.Queue = queue.Queue()
     try:
         proc = subprocess.Popen(
-            cmd_proxvn(puerto, binario), stdin=subprocess.DEVNULL,
+            cmd_proxvn(puerto, binario, servidor), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
     except FileNotFoundError:
         error("No se pudo ejecutar el cliente de ProxVN.")
         return "", None
     threading.Thread(target=_bombeo_salida, args=(proc, cola), daemon=True).start()
-    barra = Barra(f"Levantando ProxVN ({PROXVN_SERVIDOR})", limite=timeout)
+    barra = Barra(f"Levantando ProxVN ({servidor})", limite=timeout)
     if notificador:
         notificador.iniciar(barra)
     direccion = ""
@@ -1352,10 +1375,9 @@ def iniciar_tunel_proxvn(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL,
         if notificador:
             notificador.finalizar(motivo="ProxVN no dio dirección pública")
         if terminado:
-            MOTIVO_FALLO_TUNEL = _diagnostico_proxvn("el cliente terminó sin imprimir dirección",
-                                                    timeout)
+            MOTIVO_FALLO_TUNEL = _diagnostico_proxvn("el cliente terminó sin imprimir dirección", servidor)
         else:
-            MOTIVO_FALLO_TUNEL = _diagnostico_proxvn(f"no respondió en {timeout}s", timeout)
+            MOTIVO_FALLO_TUNEL = _diagnostico_proxvn(f"no respondió en {timeout}s", servidor)
         error(f"Fallo de ProxVN: {MOTIVO_FALLO_TUNEL}")
         _detener_proceso(proc, escribir_stop=False, timeout=5)
         return "", None
@@ -1364,17 +1386,20 @@ def iniciar_tunel_proxvn(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL,
 
 
 def iniciar_tunel_proxvn_detached(puerto: int, timeout: int = TIMEOUT_TUNEL,
-                                  notificador=None) -> tuple:
+                                  notificador=None, servidor: str = None) -> tuple:
     """ProxVN desacoplado: sobrevive a la salida del script."""
     global MOTIVO_FALLO_TUNEL
     MOTIVO_FALLO_TUNEL = ""
+    servidor = servidor or PROXVN_SERVIDOR
+    if not _prechequear_servidor_proxvn(servidor, notificador):
+        return "", None
     binario = PROXVN_BIN if PROXVN_BIN.is_file() else instalar_proxvn()
     if binario is None:
         raise RuntimeError("ProxVN no está disponible.")
     mango = _abrir_log(LOG_TUNEL)
     try:
         proc = subprocess.Popen(
-            cmd_proxvn(puerto, binario), stdin=subprocess.DEVNULL, stdout=mango,
+            cmd_proxvn(puerto, binario, servidor), stdin=subprocess.DEVNULL, stdout=mango,
             stderr=subprocess.STDOUT, start_new_session=True,
         )
     except FileNotFoundError:
@@ -1382,7 +1407,7 @@ def iniciar_tunel_proxvn_detached(puerto: int, timeout: int = TIMEOUT_TUNEL,
     finally:
         mango.close()
     PID_TUNEL.write_text(f"{proc.pid}\n")
-    barra = Barra(f"Levantando ProxVN ({PROXVN_SERVIDOR})", limite=timeout)
+    barra = Barra(f"Levantando ProxVN ({servidor})", limite=timeout)
     if notificador:
         notificador.iniciar(barra)
     try:
@@ -1407,7 +1432,7 @@ def iniciar_tunel_proxvn_detached(puerto: int, timeout: int = TIMEOUT_TUNEL,
                 notificador.pulso(barra)
             time.sleep(0.2)
         barra.finalizar()
-        MOTIVO_FALLO_TUNEL = _diagnostico_proxvn(f"no respondió en {timeout}s", timeout)
+        MOTIVO_FALLO_TUNEL = _diagnostico_proxvn(f"no respondió en {timeout}s", servidor)
         if notificador:
             notificador.finalizar(motivo="ProxVN no dio dirección pública")
         error(f"No se obtuvo la dirección de ProxVN: {MOTIVO_FALLO_TUNEL}")
@@ -1451,14 +1476,16 @@ def _sin_tunel() -> tuple:
     return "", None
 
 
-def abrir_tunel(puerto: int, notificador=None, timeout: int = TIMEOUT_TUNEL) -> tuple:
+def abrir_tunel(puerto: int, notificador=None, timeout: int = TIMEOUT_TUNEL,
+                servidor: str = None) -> tuple:
     """Abre el túnel con ProxVN y devuelve (direccion, proceso).
 
     Comprueba siempre que la dirección obtenida responde de verdad: así una IP
     inventada o un puerto equivocado nunca se anuncian como si fueran el
     servidor.
     """
-    direccion, proc = iniciar_tunel_proxvn(puerto, timeout=timeout, notificador=notificador)
+    direccion, proc = iniciar_tunel_proxvn(puerto, timeout=timeout, notificador=notificador,
+                                          servidor=servidor)
     if direccion and _listo_para_verificar(direccion):
         ok(f"Túnel ProxVN verificado: {direccion}")
         return direccion, proc
@@ -1470,10 +1497,11 @@ def abrir_tunel(puerto: int, notificador=None, timeout: int = TIMEOUT_TUNEL) -> 
 
 
 def abrir_tunel_detached(puerto: int, notificador=None,
-                         timeout: int = TIMEOUT_TUNEL) -> tuple:
+                         timeout: int = TIMEOUT_TUNEL, servidor: str = None) -> tuple:
     """ProxVN desacoplado: el túnel sigue vivo aunque el script termine."""
     direccion, proc = iniciar_tunel_proxvn_detached(puerto, timeout=timeout,
-                                                    notificador=notificador)
+                                                    notificador=notificador,
+                                                    servidor=servidor)
     if direccion and _listo_para_verificar(direccion):
         ok(f"Túnel ProxVN verificado: {direccion}")
         return direccion, proc
@@ -1673,7 +1701,8 @@ def modo_notificacion(args) -> int:
         if args.sin_tunnel:
             aviso("Túnel omitido (--sin-tunnel): la IP no será pública.")
         else:
-            direccion, _proc = abrir_tunel_detached(args.puerto, notificador=notificador)
+            direccion, _proc = abrir_tunel_detached(args.puerto, notificador=notificador,
+                                                   servidor=args.tunel_servidor)
 
     # 4. Aviso con la IP (o con el motivo del fallo)
     notificar_servidor(webhook, direccion, args.puerto, MOTIVO_FALLO_TUNEL)
@@ -2194,6 +2223,9 @@ def parse_args():
     p.add_argument("--puerto", type=int, default=PUERTO_MC, help="Puerto del servidor (25565)")
     p.add_argument("--memoria", default=MEMORIA_MAXIMA, help="Memoria máxima, p. ej. 3G")
     p.add_argument("--sin-tunnel", action="store_true", help="No levantar ningún túnel")
+    p.add_argument("--tunel-servidor", metavar="HOST:PUERTO", default="",
+                   help="Usar tu propio servidor ProxVN (autohospedado) en lugar del "
+                        "servidor comunitario por defecto")
     p.add_argument("--sin-push", action="store_true", help="No hacer commit/push al final")
     p.add_argument("--sin-respaldo", action="store_true",
                    help="No comprimir el servidor antes de subirlo")
@@ -2320,7 +2352,8 @@ def main():
 
         # 3. Túnel ProxVN con barra de carga
         if not args.sin_tunnel:
-            direccion, tunel_proc = abrir_tunel(args.puerto, notificador=notificador)
+            direccion, tunel_proc = abrir_tunel(args.puerto, notificador=notificador,
+                                               servidor=args.tunel_servidor)
         else:
             aviso("Túnel omitido (--sin-tunnel).")
 
