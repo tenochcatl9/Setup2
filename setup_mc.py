@@ -8,7 +8,8 @@ Script de despliegue para servidor de Minecraft Paper en Codespaces.
 - Si no existe, descarga la última versión estable de Paper desde la API v3
   (con barra de progreso).
 - Ejecuta el servidor una vez para generar la carpeta plugins y lo detiene.
-- Descarga e instala los plugins ViaVersion, ViaBackwards y AuthMe (login).
+- Descarga e instala los plugins ViaVersion, ViaBackwards, AuthMe (login) y
+  SkinsRestorer, que se actualiza en cada ejecución contra Modrinth.
   El servidor admite de la 1.10 hasta la última versión: ViaVersion y
   ViaBackwards mantienen el rango actualizado solos.
 - Levanta el servidor y espera a que escuche en el puerto 25565.
@@ -498,12 +499,20 @@ def _detener_proceso(proc, escribir_stop: bool = True, timeout: int = 30):
             pass
 
 
-# ─── 5. Descargar plugins (ViaVersion + ViaBackwards + AuthMe) ────────────
+# ─── 5. Descargar plugins (ViaVersion + ViaBackwards + AuthMe + SkinsRestorer) ──
 # repo de GitHub, nombre local, y qué texto del asset identify (evita coger
 # la build de Bungee/Velocity/Folia en repos que publican varias).
 PLUGIN_AUTHME = "AuthMe.jar"
 PLUGIN_VIAVERSION = "ViaVersion.jar"
 PLUGIN_VIABACKWARDS = "ViaBackwards.jar"
+PLUGIN_SKINSRESTORER = "SkinsRestorer.jar"
+# SkinsRestorer se publica en Modrinth (no en el release de GitHub del proyecto).
+PROYECTO_SKINSRESTORER = "skinsrestorer"
+# Se pide en este orden: la primera coincidencia gana.
+CARGA_SKINSRESTORER = ["paper", "purpur", "spigot", "bukkit"]
+# Última versión instalada de cada plugin que se reza actualiza; comparte
+# carpeta con ESTADO_RESPALDO (~/.local/state/setup_mc/).
+ESTADO_PLUGINS = Path.home() / ".local" / "state" / "setup_mc" / "plugins.json"
 # El minimo depende del AuthMe: las builds modernas de AuthMe son 1.10+.
 VER_MINIMA_MC = "1.10"
 
@@ -559,6 +568,82 @@ def descargar_plugin_github(repo: str, nombre_archivo: str, forzar: bool = False
     barra.finalizar(f"{nombre_archivo} instalado en {destino}")
 
 
+def _sha1_archivo(ruta: Path) -> str:
+    h = hashlib.sha1()
+    with open(ruta, "rb") as f:
+        for bloque in iter(lambda: f.read(1 << 20), b""):
+            h.update(bloque)
+    return h.hexdigest()
+
+
+def _leer_estado_plugins() -> dict:
+    try:
+        return json.loads(ESTADO_PLUGINS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _guardar_estado_plugins(nombre: str, datos: dict) -> None:
+    estado = _leer_estado_plugins()
+    estado[nombre] = datos
+    try:
+        ESTADO_PLUGINS.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO_PLUGINS.write_text(json.dumps(estado, indent=2))
+    except OSError:
+        pass
+
+
+def version_skinsrestorer() -> str:
+    return _leer_estado_plugins().get(PROYECTO_SKINSRESTORER, {}).get("version", "?")
+
+
+def actualizar_skinsrestorer() -> str:
+    """Deja siempre la última versión de SkinsRestorer (se comprueba en cada
+    ejecución, a diferencia de los plugins de GitHub que solo se instalan una vez).
+
+    Se compara el sha1 del jar local con el que publica Modrinth: así se
+    detectan versiones nuevas sin volver a bajar 8 MB cuando nada ha cambiado.
+    """
+    destino = PLUGINS_DIR / PLUGIN_SKINSRESTORER
+    cabeceras = {"User-Agent": "setup-mc (respaldo servidor minecraft)"}
+    url = f"https://api.modrinth.com/v2/project/{PROYECTO_SKINSRESTORER}/version"
+    r = requests.get(url, params={"loaders": json.dumps(CARGA_SKINSRESTORER)},
+                     headers=cabeceras, timeout=25)
+    r.raise_for_status()
+    versiones = [v for v in r.json() if v.get("files")]
+    if not versiones:
+        raise RuntimeError("Modrinth no devolvió ninguna versión de SkinsRestorer.")
+    version = versiones[0]
+    archivo = version["files"][0]
+    sha1 = archivo["hashes"]["sha1"]
+    if destino.is_file() and _sha1_archivo(destino) == sha1:
+        log(f"SkinsRestorer ya está al día: v{version['version_number']}.")
+        return version["version_number"]
+    barra = Barra(f"Descargando SkinsRestorer {version['version_number']}",
+                  total=int(archivo.get("size") or 0) or None)
+    PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+    temporal = destino.with_suffix(".jar.part")
+    with requests.get(archivo["url"], stream=True, headers=cabeceras, timeout=180) as resp:
+        resp.raise_for_status()
+        with open(temporal, "wb") as f:
+            for bloque in resp.iter_content(chunk_size=262144):
+                if bloque:
+                    f.write(bloque)
+                    if barra.total:
+                        barra.avanzar(len(bloque))
+    if _sha1_archivo(temporal) != sha1:
+        temporal.unlink(missing_ok=True)
+        raise RuntimeError("El jar de SkinsRestorer no coincide con su sha1 en Modrinth.")
+    temporal.replace(destino)
+    barra.finalizar(f"SkinsRestorer v{version['version_number']} en {destino}")
+    _guardar_estado_plugins(PROYECTO_SKINSRESTORER, {
+        "version": version["version_number"],
+        "sha1": sha1,
+        "actualizado": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return version["version_number"]
+
+
 CONFIG_AUTHME = PLUGINS_DIR / "AuthMe" / "config.yml"
 
 
@@ -600,7 +685,15 @@ def instalar_plugins(forzar: bool = False) -> None:
     descargar_plugin_github("AuthMe/AuthMeReloaded", PLUGIN_AUTHME, forzar,
                             preferir="-Paper.jar|AuthMe.jar")
     configurar_authme()
-    ok(f"Plugins listos: {rango_versiones()} vía ViaVersion/ViaBackwards + login con AuthMe.")
+    # SkinsRestorer sí se revisa en cada ejecución (cambia a menudo y sin
+    # avisos de versión nueva). Si Modrinth falla, el servidor arranca igual.
+    try:
+        version_skin = actualizar_skinsrestorer()
+    except (requests.RequestException, RuntimeError, KeyError) as exc:
+        version_skin = "?"
+        aviso(f"No se pudo comprobar SkinsRestorer en Modrinth: {exc}")
+    ok(f"Plugins listos: {rango_versiones()} vía ViaVersion/ViaBackwards, "
+       f"login con AuthMe y SkinsRestorer {version_skin}.")
 
 
 # ─── 6. .gitignore y protección de secretos ───────────────────────────────
@@ -1987,6 +2080,7 @@ def modo_notificacion(args) -> int:
     if proveedor_usado:
         print(f"  Servicio      : {PROVEEDORES[proveedor_usado]['nombre']}")
     print(f"  Versiones     : {rango_versiones()}  (ViaVersion + ViaBackwards)")
+    print(f"  Skins         : SkinsRestorer {version_skinsrestorer()}  (se actualiza al correr)")
     print("  Login         : AuthMe  (regístrate la primera vez, luego /login)")
     print(f"  Servidor PID  : {_leer_pid(PID_SERVIDOR) or '?'}   (log: {LOG_SERVIDOR})")
     print(f"  Túnel PID     : {_leer_pid(PID_TUNEL) or '?'}   (log: {LOG_TUNEL})")
@@ -2084,14 +2178,24 @@ def _leer_estado_respaldo() -> dict:
         return {}
 
 
-def _guardar_estado_respaldo(hash_contenido: str):
+def _guardar_estado_respaldo(hash_contenido: str, alias: str = ""):
+    """Apunta el contenido del respaldo subido.
+
+    `alias` guarda el hash de la lista de archivos que se probó antes de
+    recalcular (por ejemplo cuando el paquete con server.jar resultaba
+    demasiado grande): sin él, la comprobación de la siguiente ejecución
+    compararía hashes de listas distintas y nunca coincidirían.
+    """
+    datos = {
+        "contenido_sha256": hash_contenido,
+        "cuando": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "version": "servidor-mc.tar.zst",
+    }
+    if alias and alias != hash_contenido:
+        datos["contenido_sha256_previo"] = alias
     try:
         ESTADO_RESPALDO.parent.mkdir(parents=True, exist_ok=True)
-        ESTADO_RESPALDO.write_text(json.dumps({
-            "contenido_sha256": hash_contenido,
-            "cuando": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "version": "servidor-mc.tar.zst",
-        }, indent=2))
+        ESTADO_RESPALDO.write_text(json.dumps(datos, indent=2))
     except OSError:
         pass
 
@@ -2101,7 +2205,9 @@ def _respaldo_sigue_vigente(hash_contenido: str) -> bool:
 
     Evita volver a subir ~70 MB idénticos cuando el mundo no ha cambiado.
     """
-    if _leer_estado_respaldo().get("contenido_sha256") != hash_contenido:
+    estado = _leer_estado_respaldo()
+    conocidos = {estado.get("contenido_sha256"), estado.get("contenido_sha256_previo")}
+    if hash_contenido not in conocidos - {None, ""}:
         return False
     rel = _relativo(_paquete_respaldo())
     return _git(["ls-files", "--error-unmatch", rel]).returncode == 0
@@ -2283,6 +2389,7 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
     con_jar, motivo_jar = decidir_jar_del_respaldo(con_jar)
     incluir = [p for p in BACKUP_INCLUYE if con_jar or p != "server.jar"]
     archivos, hash_contenido = _hash_contenido(SERVER_DIR, incluir)
+    hash_inicial = hash_contenido
     if motivo_jar and not con_jar:
         log(f"    Motivo: {motivo_jar}.")
     RESPALDO_ACTUAL = _paquete_respaldo()
@@ -2303,6 +2410,23 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
     }
     try:
         _empaquetar(RESPALDO_ACTUAL, manifiesto, incluir)
+        # GitHub no acepta blobs de más de 100 MB: si el mundo ha crecido tanto
+        # que el paquete con server.jar no cabe, se rehace sin él en vez de
+        # dejar un respaldo imposible de subir.
+        tam = RESPALDO_ACTUAL.stat().st_size
+        if con_jar and tam > TAMANO_MAXIMO:
+            aviso(f"Con server.jar el respaldo llega a {tam / 1048576:,.0f} MB "
+                  f"y GitHub rechaza archivos de más de {TAMANO_MAXIMO // 1048576} MB: "
+                  f"se repite sin server.jar.")
+            log("    Se podrá volver a incluir cuando el mundo se pode o se "
+                "migre a GitHub Releases.")
+            con_jar = False
+            incluir = [q for q in incluir if q != "server.jar"]
+            archivos, hash_contenido = _hash_contenido(SERVER_DIR, incluir)
+            manifiesto["con_server_jar"] = False
+            manifiesto["contenido_sha256"] = hash_contenido
+            manifiesto["archivos"] = archivos
+            _empaquetar(RESPALDO_ACTUAL, manifiesto, incluir)
     except RuntimeError as e:
         error(str(e))
         return False
@@ -2335,6 +2459,9 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
     ok(f"Respaldo listo: {_relativo(RESPALDO_ACTUAL)} "
        f"(MC {manifiesto['minecraft']}, {archivos} archivos, "
        f"{'con' if con_jar else 'sin'} server.jar)")
+    # Se apunta el contenido para que la próxima ejecución con el mundo
+    # idéntico no vuelva a subir el mismo tarball.
+    _guardar_estado_respaldo(hash_contenido, hash_inicial)
     return True
 
 
@@ -2777,6 +2904,7 @@ def main():
         if proveedor_usado:
             print(f"  Servicio     : {PROVEEDORES[proveedor_usado]['nombre']}")
         print(f"  Versiones    : {rango_versiones()}  (ViaVersion + ViaBackwards)")
+        print(f"  Skins        : SkinsRestorer {version_skinsrestorer()}  (se actualiza al correr)")
         print("  Login        : AuthMe  (regístrate la primera vez, luego /login)")
         print("  Presiona Ctrl+C para detener el servidor y cerrar el túnel.")
         print()
