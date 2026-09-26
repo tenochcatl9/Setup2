@@ -1133,7 +1133,9 @@ class NotificadorTunel:
 # Asyx: nativo de Minecraft, subdominio permanente y registro SRV (el jugador
 # escribe solo el hostname). Necesita alta con email, una vez.
 # Pinggy: solo ssh, sin cuenta, pero con tope de 60 min y URL cambiante.
-ASYX_REGISTRO = "https://asyx.ai/register"
+ASYX_REGISTRO = "https://www.asyx.ai/register"
+ASYX_CONSOLE = "https://www.asyx.ai/console/tunnel"
+ASYX_STS = "https://www.asyx.ai/www/sts"
 ASYNX_DOMINIO = ".tunnel.asyx.ai"
 PINGGY_SERVIDOR = "free.pinggy.io"
 PINGGY_PUERTO = 443
@@ -1205,6 +1207,148 @@ def asyx_esta_alto() -> bool:
     return asyx_estado_alta() == "completa"
 
 
+def asyx_registrar(minutos: int = 15) -> bool:
+    """Da de alta el dispositivo en Asyx mostrando la URL de registro.
+
+    El CLI oficial (npx asyx setup) abre el navegador con la URL del registro
+    pero no la imprime, así que en un Codespace headless no hay forma de
+    completarlo. Aquí hacemos lo mismo a mano, enseñando la URL y esperando
+    bastante más tiempo: el registro se hace en el navegador del usuario, no
+    en esta máquina.
+    """
+    if not _comando_existe("openssl"):
+        error("Asyx necesita 'openssl' para generar la clave del dispositivo.")
+        return False
+    base = Path.home() / ".asyx"
+    device_json = base / "device.json"
+    client_id = ""
+    if device_json.is_file():
+        try:
+            client_id = json.loads(device_json.read_text()).get("clientId", "")
+        except (ValueError, OSError):
+            client_id = ""
+    if not re.fullmatch(r"cli_[A-F0-9]{12}", client_id or ""):
+        client_id = "cli_" + os.urandom(6).hex().upper()
+    base.mkdir(parents=True, exist_ok=True)
+    device_json.write_text(json.dumps({"clientId": client_id}, indent=2))
+    certs = base / "certs" / client_id
+    certs.mkdir(parents=True, exist_ok=True)
+    try:
+        certs.chmod(0o700)
+    except OSError:
+        pass
+    clave = certs / "private.pem.key"
+    csr = certs / "device.csr.pem"
+
+    if not clave.is_file():
+        r = subprocess.run(["openssl", "genrsa", "-traditional", "-out", str(clave), "2048"],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 or not clave.is_file():
+            error(f"No se pudo generar la clave: {(r.stderr or '').strip()[:200]}")
+            return False
+    clave.chmod(0o600)
+    r = subprocess.run(["openssl", "req", "-new", "-key", str(clave),
+                        "-subj", f"/CN={client_id}/O=Asyx", "-sha256", "-out", str(csr)],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 or not csr.is_file():
+        error(f"No se pudo generar el CSR: {(r.stderr or '').strip()[:200]}")
+        return False
+
+    ticket = os.urandom(16).hex()
+    url = f"{ASYX_CONSOLE}?clientId={client_id}&ticket={ticket}"
+    titulo("ALTA DE ASYX: REGÍSTRATE EN TU NAVEGADOR")
+    print("  1) Abre este enlace en el navegador de tu ORDENADOR")
+    print("     (no en el Codespace: aquí no hay navegador):")
+    print()
+    print(f"       {url}")
+    print()
+    print("  2) Inicia sesión o crea la cuenta (es gratis, sin tarjeta) y")
+    print("     completa el registro.")
+    print(f"  3) Vuelve aquí: esperaré hasta {minutos} minutos a que Asyx")
+    print("     emita el certificado.")
+    print()
+    try:
+        abrir_navegador(url)
+    except Exception:  # noqa: BLE001
+        pass
+
+    limite = time.time() + minutos * 60
+    barra = Barra("Esperando el certificado de Asyx", limite=minutos * 60)
+    intentos = 0
+    try:
+        while time.time() < limite:
+            intentos += 1
+            barra.refrescar()
+            try:
+                r = requests.post(ASYX_STS, json={"ticket": ticket, "clientId": client_id,
+                                                 "csrPem": csr.read_text()},
+                                  headers={"content-type": "application/json",
+                                           "accept": "application/json"},
+                                  timeout=25)
+            except requests.RequestException:
+                time.sleep(2)
+                continue
+            if r.status_code in (200, 201):
+                if "json" not in (r.headers.get("content-type") or ""):
+                    # Sin sesión iniciada Asyx devuelve su web, no el certificado.
+                    if intentos < 3:
+                        aviso("Aún no veo tu sesión: completa el registro en el enlace.")
+                    time.sleep(3)
+                    continue
+                try:
+                    emitido = r.json()
+                except ValueError:
+                    time.sleep(3)
+                    continue
+                (certs / "AmazonRootCA1.pem").write_text(emitido["caPem"])
+                (certs / "device.pem.crt").write_text(emitido["certPem"])
+                manifest = {"clientId": client_id, "endpoint": emitido.get("endpoint", ""),
+                            "region": emitido.get("region", ""),
+                            "issuedAt": int(time.time() * 1000)}
+                manifest_path = certs / "manifest.json"
+                manifest_path.write_text(json.dumps(manifest, indent=2))
+                for ruta, modo in ((certs / "AmazonRootCA1.pem", 0o644),
+                                   (certs / "device.pem.crt", 0o600),
+                                   (manifest_path, 0o600)):
+                    try:
+                        ruta.chmod(modo)
+                    except OSError:
+                        pass
+                barra.finalizar("Certificado recibido")
+                ok(f"Asyx dado de alta. Tu subdominio se reservó con {client_id}.")
+                return True
+            if r.status_code in (401, 403) and intentos < 3:
+                aviso("Aún no veo tu sesión: completa el registro en el enlace.")
+            if r.status_code in (301, 302, 307, 308):
+                time.sleep(3)
+                continue
+            if r.status_code == 409:
+                barra.finalizar()
+                error("El registro no corresponde a esta máquina (HTTP 409).")
+                log(f"    Vuelve a intentarlo; si persiste, borra {base} y rehaz el alta.")
+                return False
+            time.sleep(3)
+        barra.finalizar()
+    finally:
+        if _barra_activa is barra:
+            barra.finalizar()
+    error(f"Asyx no emitió el certificado en {minutos} minutos.")
+    log("    Reintenta cuando termines el registro:  npx -y asyx@latest setup")
+    return False
+
+
+def abrir_navegador(url: str) -> bool:
+    """Intenta abrir la URL; enCodespace no hay navegador y no es un error."""
+    for cmd in (["xdg-open", url], ["gio", "open", url]):
+        if _comando_existe(cmd[0]):
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except OSError:
+                continue
+    return False
+
+
 def asyx_preparar() -> bool:
     """Comprueba Node y pide el alta si falta. True si queda listo para usar."""
     if not _comando_existe("node") or not (_comando_existe("npx") or _comando_existe("npm")):
@@ -1232,19 +1376,18 @@ def asyx_preparar() -> bool:
     print("  2) Vuelve aquí y ejecuta el alta, que abre el navegador para")
     print("     verificar el email y reservar tu subdominio permanente.")
     print()
-    if _preguntar("  ¿Lanzar ahora el alta de Asyx? [s/N]: ") == "s":
-        log("Abriendo el navegador de alta... complétalo y vuelve aquí.")
-        try:
-            return subprocess.run(["npx", "-y", "asyx@latest", "setup"],
-                                  timeout=300).returncode == 0 and asyx_esta_alto()
-        except (OSError, subprocess.TimeoutExpired) as e:
-            error(f"No se pudo completar el alta: {e}")
-    else:
-        log("Puedes hacerlo más tarde con:  npx -y asyx@latest setup")
+    if _preguntar("  ¿Empezar el alta ahora? [s/N]: ") == "s":
+        if asyx_estado_alta() == "incompleta":
+            log("Se reutiliza tu clientId, así que conservas el subdominio.")
+        return asyx_registrar()
+    log("Hazlo más tarde con:  python3 setup_mc.py --registrar-asyx")
+    log("El CLI oficial también vale, pero no imprime el enlace de registro:")
+    log("                       npx -y asyx@latest setup")
     if asyx_esta_alto():
         ok("Asyx dado de alta.")
         return True
-    aviso("Asyx no está operativo: se usará Pinggy como respaldo.")
+    aviso("Asyx se queda fuera: el túnel irá por Pinggy (60 min, IP cambiante).")
+    log("    Para usar Asyx de verdad:  python3 setup_mc.py --registrar-asyx")
     return False
 
 
@@ -1398,11 +1541,14 @@ def _intentar_proveedor(clave: str, puerto: int, timeout: int, notificador) -> t
     nombre = prov["nombre"]
     MOTIVO_FALLO_TUNEL = ""
 
+    # Primero preparar: es donde se pregunta al usuario por el alta de Asyx.
+    # Si se comprobara la red antes, el prechequeo fallaría sin alta y nunca
+    # se llegaría al prompt, y el script se iría a Pinggy sin preguntar nada.
+    if not prov["preparar"]():
+        return "", None, False, f"{nombre} no está preparado"
     bien, motivo = prov["prechequear"]()
     if not bien:
         return "", None, False, motivo
-    if not prov["preparar"]():
-        return "", None, False, "no se pudo completar la preparación"
 
     cola: queue.Queue = queue.Queue()
     try:
@@ -1434,11 +1580,14 @@ def _intentar_proveedor_detached(clave: str, puerto: int, timeout: int, notifica
     nombre = prov["nombre"]
     MOTIVO_FALLO_TUNEL = ""
 
+    # Primero preparar: es donde se pregunta al usuario por el alta de Asyx.
+    # Si se comprobara la red antes, el prechequeo fallaría sin alta y nunca
+    # se llegaría al prompt, y el script se iría a Pinggy sin preguntar nada.
+    if not prov["preparar"]():
+        return "", None, False, f"{nombre} no está preparado"
     bien, motivo = prov["prechequear"]()
     if not bien:
         return "", None, False, motivo
-    if not prov["preparar"]():
-        return "", None, False, "no se pudo completar la preparación"
 
     mango = _abrir_log(LOG_TUNEL, truncar=True)
     try:
@@ -2338,6 +2487,8 @@ def parse_args():
                         "(Asyx con respaldo a Pinggy)")
     p.add_argument("--tunel-diag", action="store_true",
                    help="Comprobar en segundos si el túnel puede abrirse y salir")
+    p.add_argument("--registrar-asyx", action="store_true",
+                   help="Registrar el dispositivo en Asyx (imprime el enlace) y salir")
     p.add_argument("--sin-push", action="store_true", help="No hacer commit/push al final")
     p.add_argument("--sin-respaldo", action="store_true",
                    help="No comprimir el servidor antes de subirlo")
@@ -2416,7 +2567,18 @@ def main():
     configurar_gitignore()
     exigir_env_protegido()
 
-    # 0a. Diagnóstico del túnel
+    # 0a. Alta de Asyx (registro en el navegador del usuario)
+    if args.registrar_asyx:
+        if asyx_esta_alto():
+            ok("Asyx ya está dado de alta; no hace falta registrarlo.")
+            return 0
+        if not sys.stdin.isatty():
+            error("El alta de Asyx necesita una terminal: ejecuta el script sin "
+                  "redirigir la entrada.")
+            return 1
+        return 0 if asyx_registrar() else 1
+
+    # 0b. Diagnóstico del túnel
     if args.tunel_diag:
         return diagnostico_tunel()
 
