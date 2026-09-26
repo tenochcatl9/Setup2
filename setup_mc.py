@@ -13,10 +13,16 @@ Script de despliegue para servidor de Minecraft Paper en Codespaces.
 - Expone el puerto con QuickTunnel mostrando una barra de carga.
 - Envía la dirección pública a un webhook de Discord.
 - Al terminar, sube los cambios a la rama principal del repositorio.
+
+Modos:
+  python3 setup_mc.py                  flujo completo (servidor en primer plano)
+  python3 setup_mc.py --solo-notificar deja servidor y túnel en segundo plano,
+                                       avisa a Discord con la IP y sube a Git
 """
 
 import argparse
 import itertools
+import os
 import queue
 import re
 import shutil
@@ -49,6 +55,11 @@ EULA_FILE = SERVER_DIR / "eula.txt"
 WEBHOOK_ENV_FILE = SERVER_DIR / ".env"
 GITIGNORE_FILE = SERVER_DIR / ".gitignore"
 ENV_EJEMPLO = SERVER_DIR / ".env.example"
+LOGS_DIR = SERVER_DIR / "logs"
+LOG_SERVIDOR = LOGS_DIR / "servidor.log"
+LOG_TUNEL = LOGS_DIR / "tunel.log"
+PID_SERVIDOR = SERVER_DIR / "servidor.pid"
+PID_TUNEL = SERVER_DIR / "tunel.pid"
 
 PAPER_API = "https://fill.papermc.io/v3/projects/paper"
 USER_AGENT = "CodeSpace-MC-Setup/1.0 (contact: tu@email.com)"
@@ -712,15 +723,23 @@ def enviar_a_discord(webhook_url: str, mensaje: str):
 
 
 # ─── 8. Levantar el servidor ─────────────────────────────────────────────
+def cmd_servidor(puerto: int) -> list:
+    return ["java", f"-Xms{MEMORIA_INICIAL}", f"-Xmx{MEMORIA_MAXIMA}",
+            "-XX:+UseG1GC", "-jar", str(SERVER_JAR), "nogui", "--port", str(puerto)]
+
+
 def arrancar_servidor(puerto: int):
     """Arranca el servidor en segundo plano y devuelve (proceso, cola de logs)."""
-    cmd = ["java", f"-Xms{MEMORIA_INICIAL}", f"-Xmx{MEMORIA_MAXIMA}",
-           "-XX:+UseG1GC", "-jar", str(SERVER_JAR), "nogui", "--port", str(puerto)]
+    if puerto_abierto(puerto):
+        raise RuntimeError(
+            f"El puerto {puerto} ya está ocupado por otro proceso. "
+            f"Deténlo, o usa otro con  --puerto XXXX  (si es un servidor de este "
+            f"script en modo --solo-notificar, puedes reutilizarlo).")
     log(f"Arrancando servidor en {SERVER_DIR} (puerto {puerto})...")
     try:
         proc = subprocess.Popen(
-            cmd, cwd=str(SERVER_DIR), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            cmd_servidor(puerto), cwd=str(SERVER_DIR), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
     except FileNotFoundError:
         raise RuntimeError("No se encontró 'java' en el PATH.")
@@ -768,15 +787,9 @@ def seguir_servidor(proc, cola: queue.Queue):
 
 
 # ─── 9. QuickTunnel con barra de carga ────────────────────────────────────
-def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL) -> tuple:
-    """Lanza QuickTunnel vía SSH y devuelve (direccion_mc, proceso).
-
-    Muestra una barra de carga mientras espera la URL pública.
-    """
-    if not comprobar_ssh():
-        error("No se encontró 'ssh' en el PATH. Instala openssh-client para usar QuickTunnel.")
-        return "", None
-    cmd = [
+def cmd_ssh(puerto: int) -> list:
+    """Comando de QuickTunnel: redirige el puerto remoto al local."""
+    return [
         "ssh", "-N",
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
@@ -786,6 +799,23 @@ def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL) -
         "-R", f"{PUERTO_TUNEL}:localhost:{puerto}",
         QUICKTUNNEL_HOST,
     ]
+
+
+def buscar_url(texto: str) -> str:
+    """Extrae el host público del túnel de una línea de salida de ssh."""
+    m = RE_URL_TUNEL.search(texto) or RE_URL_CUALQUIERA.search(texto)
+    return m.group(1) if m else ""
+
+
+def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL) -> tuple:
+    """Lanza QuickTunnel vía SSH y devuelve (direccion_mc, proceso).
+
+    Muestra una barra de carga mientras espera la URL pública.
+    """
+    if not comprobar_ssh():
+        error("No se encontró 'ssh' en el PATH. Instala openssh-client para usar QuickTunnel.")
+        return "", None
+    cmd = cmd_ssh(puerto)
     cola: queue.Queue = queue.Queue()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -814,9 +844,8 @@ def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL) -
             if texto:
                 limpiar_linea()
                 print(f"    {texto}")
-            m = RE_URL_TUNEL.search(texto) or RE_URL_CUALQUIERA.search(texto)
-            if m:
-                host_publico = m.group(1)
+            host_publico = buscar_url(texto)
+            if host_publico:
                 break
         _drenar(cola)
     finally:
@@ -849,7 +878,216 @@ def detener_tunel(proc):
     _detener_proceso(proc, escribir_stop=False, timeout=8)
 
 
-# ─── 10. Commit y push a la rama principal ───────────────────────────────
+# ─── 10. Modo "--solo-notificar": procesos en segundo plano ───────────────
+def _leer_pid(ruta: Path):
+    try:
+        return int(ruta.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _vivo(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError, PermissionError):
+        return False
+
+
+def _matar_pid(pid, espera: float = 5.0) -> bool:
+    if not _vivo(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    fin = time.time() + espera
+    while time.time() < fin:
+        if not _vivo(pid):
+            return True
+        time.sleep(0.2)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    return True
+
+
+def _limpiar_pid(ruta: Path):
+    try:
+        ruta.unlink()
+    except OSError:
+        pass
+
+
+def _abrir_log(ruta: Path):
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    f = open(ruta, "a", buffering=1)
+    f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    return f
+
+
+def url_en_log(ruta: Path) -> str:
+    """Última URL de túnel que aparece en el log de ssh."""
+    try:
+        texto = ruta.read_text(errors="replace")
+    except OSError:
+        return ""
+    for patron in (RE_URL_TUNEL, RE_URL_CUALQUIERA):
+        encontrados = patron.findall(texto)
+        if encontrados:
+            return encontrados[-1]
+    return ""
+
+
+def arrancar_servidor_detached(puerto: int):
+    """Arranca el servidor desacoplado: sobrevive a la salida del script."""
+    log(f"Arrancando servidor en segundo plano (puerto {puerto})...")
+    mango = _abrir_log(LOG_SERVIDOR)
+    try:
+        proc = subprocess.Popen(
+            cmd_servidor(puerto), cwd=str(SERVER_DIR), stdin=subprocess.DEVNULL,
+            stdout=mango, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("No se encontró 'java' en el PATH.")
+    finally:
+        mango.close()
+    PID_SERVIDOR.write_text(f"{proc.pid}\n")
+    return proc
+
+
+def iniciar_tunel_detached(puerto: int, timeout: int = TIMEOUT_TUNEL) -> tuple:
+    """QuickTunnel desacoplado. La URL se lee del log porque no hay tubería."""
+    cmd = cmd_ssh(puerto)
+    if shutil.which("stdbuf"):
+        cmd = ["stdbuf", "-oL", "-eL", *cmd]
+    mango = _abrir_log(LOG_TUNEL)
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=mango, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("No se encontró 'ssh' en el PATH.")
+    finally:
+        mango.close()
+    PID_TUNEL.write_text(f"{proc.pid}\n")
+    barra = Barra(f"Levantando QuickTunnel ({QUICKTUNNEL_HOST})", limite=timeout)
+    try:
+        while time.time() - barra.inicio < timeout:
+            if proc.poll() is not None:
+                barra.finalizar()
+                detalle = LOG_TUNEL.read_text(errors="replace").strip() if LOG_TUNEL.is_file() else ""
+                error("QuickTunnel terminó antes de dar la URL:\n" +
+                      (detalle[-400:] or "(sin salida)"))
+                _limpiar_pid(PID_TUNEL)
+                return "", None
+            host = url_en_log(LOG_TUNEL)
+            if host:
+                barra.finalizar("QuickTunnel activo")
+                return f"{host}:{PUERTO_TUNEL}", proc
+            barra.refrescar()
+            time.sleep(0.2)
+        barra.finalizar()
+        error(f"No se obtuvo la URL de QuickTunnel en {timeout} segundos.")
+        _matar_pid(proc.pid)
+        _limpiar_pid(PID_TUNEL)
+        return "", None
+    finally:
+        barra.finalizar()
+
+
+def _parar_anterior(ruta_pid: Path, etiqueta: str) -> bool:
+    """Cierra el proceso de una ejecución anterior para no acumular túneles."""
+    pid = _leer_pid(ruta_pid)
+    if not _vivo(pid):
+        _limpiar_pid(ruta_pid)
+        return False
+    log(f"Cerrando el {etiqueta} de la ejecución anterior (PID {pid})...")
+    _matar_pid(pid)
+    _limpiar_pid(ruta_pid)
+    return True
+
+
+def modo_notificacion(args) -> int:
+    """Deja servidor y túnel vivos, avisa a Discord y sube los cambios."""
+    codigo = 0
+    # 1. Servidor
+    pid_servidor = _leer_pid(PID_SERVIDOR)
+    if puerto_abierto(args.puerto):
+        ok(f"Ya hay un servidor escuchando en el puerto {args.puerto}"
+           + (f" (PID {pid_servidor})" if _vivo(pid_servidor) else " (externo)"))
+    else:
+        _parar_anterior(PID_SERVIDOR, "servidor")
+        proc_srv = arrancar_servidor_detached(args.puerto)
+        if not esperar_puerto(args.puerto, proc_srv):
+            error("El servidor no abrió el puerto a tiempo.")
+            return 1
+        ok(f"Servidor en segundo plano (PID {proc_srv.pid}, log: {LOG_SERVIDOR}).")
+
+    # 2. Túnel
+    direccion = ""
+    pid_tunel = _leer_pid(PID_TUNEL)
+    if _vivo(pid_tunel):
+        host = url_en_log(LOG_TUNEL)
+        if host and comprobar_tunel(host):
+            direccion = f"{host}:{PUERTO_TUNEL}"
+            ok(f"QuickTunnel anterior sigue vivo (PID {pid_tunel}): {direccion}")
+    if not direccion:
+        _parar_anterior(PID_TUNEL, "túnel")
+        if args.sin_tunnel:
+            aviso("QuickTunnel omitido (--sin-tunnel): la IP no será pública.")
+        else:
+            direccion, _proc = iniciar_tunel_detached(args.puerto)
+            if direccion:
+                if comprobar_tunel(direccion.rsplit(":", 1)[0]):
+                    ok("Túnel verificado: el puerto público responde.")
+                else:
+                    aviso("El túnel aún no responde; puede tardar unos segundos más.")
+
+    # 3. Discord
+    webhook = obtener_webhook()
+    if direccion:
+        enviar_a_discord(webhook, (
+            "🎮 **Servidor de Minecraft activo**\n"
+            f"IP: `{direccion}`\n"
+            "Entra con cualquier versión de 1.8 a 1.21: ViaVersion y "
+            "ViaBackwards hacen de traductor."
+        ))
+    else:
+        aviso("Sin IP pública no hay nada que anunciar en Discord.")
+
+    # 4. Panel con cómo pararlo
+    print()
+    print("=" * 62)
+    print("  SERVIDOR Y TÚNEL EN SEGUNDO PLANO")
+    print("=" * 62)
+    print(f"  IP pública    : {direccion or '(sin túnel)'}")
+    print(f"  Servidor PID  : {_leer_pid(PID_SERVIDOR) or '?'}   (log: {LOG_SERVIDOR})")
+    print(f"  Túnel PID     : {_leer_pid(PID_TUNEL) or '?'}   (log: {LOG_TUNEL})")
+    print()
+    print("  Ver la consola  :  tail -f logs/servidor.log")
+    print("  Cerrar túnel    :  kill $(cat tunel.pid)    # la IP deja de servir")
+    print("  Parar servidor  :  kill $(cat servidor.pid)")
+    print("=" * 62)
+    print()
+
+    # 5. Git
+    if args.sin_push:
+        aviso("Push omitido (--sin-push).")
+    else:
+        titulo("SUBIENDO CAMBIOS A LA RAMA PRINCIPAL")
+        if not subir_cambios(
+                "chore: modo --solo-notificar (servidor y túnel en segundo plano)",
+                rama=args.rama):
+            codigo = 1
+    return codigo
+
+
+# ─── 11. Commit y push a la rama principal ───────────────────────────────
 def subir_cambios(mensaje: str, rama: str = "main") -> bool:
     """Verifica secretos, hace commit y empuja a la rama principal."""
     if not es_repo_git():
@@ -900,6 +1138,8 @@ def parse_args():
     p.add_argument("--memoria", default=MEMORIA_MAXIMA, help="Memoria máxima, p. ej. 3G")
     p.add_argument("--sin-tunnel", action="store_true", help="No levantar QuickTunnel")
     p.add_argument("--sin-push", action="store_true", help="No hacer commit/push al final")
+    p.add_argument("--solo-notificar", action="store_true",
+                   help="Deja servidor y túnel en segundo plano, avisa a Discord y sube a Git")
     p.add_argument("--reinstalar-plugins", action="store_true", help="Volver a descargar los plugins")
     p.add_argument("--rama", default="main", help="Rama a la que se empuja (main)")
     return p.parse_args()
@@ -944,6 +1184,17 @@ def main():
     direccion = ""
     listo_para_subir = False
     codigo = 0
+
+    if args.solo_notificar:
+        try:
+            return modo_notificacion(args)
+        except KeyboardInterrupt:
+            aviso("Interrumpido por el usuario.")
+            return 1
+        except Exception as e:  # noqa: BLE001
+            error(str(e))
+            return 1
+
     try:
         # 2. Servidor en marcha
         servidor_proc, cola = arrancar_servidor(args.puerto)
