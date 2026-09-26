@@ -8,7 +8,9 @@ Script de despliegue para servidor de Minecraft Paper en Codespaces.
 - Si no existe, descarga la última versión estable de Paper desde la API v3
   (con barra de progreso).
 - Ejecuta el servidor una vez para generar la carpeta plugins y lo detiene.
-- Descarga e instala los plugins ViaVersion y ViaBackwards.
+- Descarga e instala los plugins ViaVersion, ViaBackwards y AuthMe (login).
+  El servidor admite de la 1.10 hasta la última versión: ViaVersion y
+  ViaBackwards mantienen el rango actualizado solos.
 - Levanta el servidor y espera a que escuche en el puerto 25565.
 - Expone el puerto con QuickTunnel mostrando una barra de carga.
 - Envía la dirección pública a un webhook de Discord.
@@ -26,6 +28,10 @@ Antes de subir cambios a la rama principal se comprime el servidor en
 respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con
 sha256). Ese archivo SÍ se versiona a propósito: es lo que permite importar
 el mundo en otra máquina.
+
+QuickTunnel exige una clave SSH propia: se genera sola la primera vez en
+~/.ssh/quicktunnel_mc (fuera del repositorio) y se usa el host localhost.run
+con el usuario 'nokey'.
 """
 
 import argparse
@@ -36,9 +42,11 @@ import json
 import os
 import queue
 import re
+import select
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -73,19 +81,24 @@ LOG_SERVIDOR = LOGS_DIR / "servidor.log"
 LOG_TUNEL = LOGS_DIR / "tunel.log"
 PID_SERVIDOR = SERVER_DIR / "servidor.pid"
 PID_TUNEL = SERVER_DIR / "tunel.pid"
+FIFO_CONSOLA = SERVER_DIR / "consola"
 RESPALDO_DIR = SERVER_DIR / "respaldo"
 MANIFIESTO = "manifest.json"
 
 PAPER_API = "https://fill.papermc.io/v3/projects/paper"
 USER_AGENT = "CodeSpace-MC-Setup/1.0 (contact: tu@email.com)"
 
-QUICKTUNNEL_HOST = "t.tn3w.dev"
+QUICKTUNNEL_HOST = "localhost.run"
+QUICKTUNNEL_USUARIO = "nokey"
+QUICKTUNNEL_ALTERNATIVOS = ["localhost.run", "t.tn3w.dev"]
+CLAVE_TUNEL = Path.home() / ".ssh" / "quicktunnel_mc"
 PUERTO_MC = 25565
 PUERTO_TUNEL = 80
 MEMORIA_INICIAL = "1G"
 MEMORIA_MAXIMA = "2G"
-TIMEOUT_TUNEL = 60
+TIMEOUT_TUNEL = 45
 TIMEOUT_ARRANQUE = 240
+INTERVALO_AVISO_TUNEL = 10
 MOTIVO_FALLO_TUNEL = ""
 
 INICIO_GITIGNORE = "# >>> INICIO bloque gestionado por setup_mc.py >>>"
@@ -98,6 +111,13 @@ RE_URL_TUNEL = re.compile(
     r"https?://([A-Za-z0-9][A-Za-z0-9.-]*\.(?:" +
     "|".join(re.escape(s) for s in SUFIJOS_TUNEL) + r"))", re.IGNORECASE)
 RE_URL_CUALQUIERA = re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9-]*\.[A-Za-z]{2,}(?:\.[A-Za-z]{2,})?)")
+RE_TUNEL_MARCADO = re.compile(r"tunneled with tls termination,?\s*(https?://[^\s\"']+)",
+                              re.IGNORECASE)
+# El banner de QuickTunnel contiene enlaces de su web: no son la IP del túnel.
+HOSTS_NO_TUNEL = {"localhost.run", "admin.localhost.run", "docs.localhost.run",
+                  "faq.localhost.run", "status.localhost.run", "blog.localhost.run",
+                  "www.localhost.run", "t.tn3w.dev", "tn3w.dev",
+                  "github.com", "twitter.com", "localhost"}
 
 # Rutas que nunca deben entrar en un commit
 PATRON_SENSIBLE = re.compile(
@@ -492,8 +512,38 @@ def _detener_proceso(proc, escribir_stop: bool = True, timeout: int = 30):
             pass
 
 
-# ─── 5. Descargar plugins (ViaVersion + ViaBackwards) ────────────────────
-def descargar_plugin_github(repo: str, nombre_archivo: str, forzar: bool = False):
+# ─── 5. Descargar plugins (ViaVersion + ViaBackwards + AuthMe) ────────────
+# repo de GitHub, nombre local, y qué texto del asset identify (evita coger
+# la build de Bungee/Velocity/Folia en repos que publican varias).
+PLUGIN_AUTHME = "AuthMe.jar"
+PLUGIN_VIAVERSION = "ViaVersion.jar"
+PLUGIN_VIABACKWARDS = "ViaBackwards.jar"
+# El minimo depende del AuthMe: las builds modernas de AuthMe son 1.10+.
+VER_MINIMA_MC = "1.10"
+
+
+def _elegir_asset(release: dict, repo: str, preferido: str = "") -> dict:
+    """Escoge el .jar correcto: por sufijo preferido o el primero válido."""
+    assets = release.get("assets", [])
+    candidatos = []
+    for a in assets:
+        nombre = a.get("name", "")
+        if not nombre.endswith(".jar"):
+            continue
+        if "sources" in nombre or "javadoc" in nombre:
+            continue
+        candidatos.append(a)
+    if not candidatos:
+        raise RuntimeError(f"No se encontró un .jar en el último release de {repo}.")
+    for sufijo in [s for s in preferido.split("|") if s]:
+        for a in candidatos:
+            if a["name"].lower().endswith(sufijo.lower()):
+                return a
+    return candidatos[0]
+
+
+def descargar_plugin_github(repo: str, nombre_archivo: str, forzar: bool = False,
+                            preferir: str = "") -> None:
     """Descarga el último release de un repositorio de GitHub."""
     destino = PLUGINS_DIR / nombre_archivo
     if destino.is_file() and not forzar:
@@ -506,14 +556,7 @@ def descargar_plugin_github(repo: str, nombre_archivo: str, forzar: bool = False
         raise RuntimeError(f"No se encontró ningún release en {repo}.")
     r.raise_for_status()
     release = r.json()
-    jar_asset = None
-    for a in release.get("assets", []):
-        nombre = a.get("name", "")
-        if nombre.endswith(".jar") and "sources" not in nombre and "javadoc" not in nombre:
-            jar_asset = a
-            break
-    if not jar_asset:
-        raise RuntimeError(f"No se encontró un .jar en el último release de {repo}.")
+    jar_asset = _elegir_asset(release, repo, preferir)
     log(f"  release {release.get('tag_name')}: {jar_asset['name']}")
     barra = Barra(f"Descargando {nombre_archivo}", total=int(jar_asset.get("size") or 0) or None)
     PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
@@ -530,10 +573,48 @@ def descargar_plugin_github(repo: str, nombre_archivo: str, forzar: bool = False
     barra.finalizar(f"{nombre_archivo} instalado en {destino}")
 
 
-def instalar_plugins(forzar: bool = False):
+CONFIG_AUTHME = PLUGINS_DIR / "AuthMe" / "config.yml"
+
+
+def configurar_authme() -> bool:
+    """Desactiva la base GeoIP de AuthMe (hace falta clave MaxMind de pago).
+
+    Sin esto, AuthMe intenta descargarla en cada arranque y llena el log de
+    avisos. Se edita por líneas para no perder los comentarios del YAML.
+    """
+    if not CONFIG_AUTHME.is_file():
+        return False
+    lineas = CONFIG_AUTHME.read_text().splitlines(keepends=True)
+    dentro = False
+    cambiado = False
+    for i, linea in enumerate(lineas):
+        if re.match(r"^\s*geoIpDatabase:\s*$", linea):
+            dentro = True
+            continue
+        if dentro:
+            m = re.match(r"^(\s*)enabled:\s*(true|false)\s*$", linea, re.IGNORECASE)
+            if m:
+                if m.group(2).lower() == "true":
+                    lineas[i] = f"{m.group(1)}enabled: false\n"
+                    cambiado = True
+                dentro = False
+            elif linea.strip() and not linea.startswith((" ", "\t")):
+                dentro = False
+    if cambiado:
+        CONFIG_AUTHME.write_text("".join(lineas))
+        ok("AuthMe: base GeoIP desactivada (hacía falta una clave MaxMind de pago).")
+    return cambiado
+
+
+def instalar_plugins(forzar: bool = False) -> None:
     PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
-    descargar_plugin_github("ViaVersion/ViaVersion", "ViaVersion.jar", forzar)
-    descargar_plugin_github("ViaVersion/ViaBackwards", "ViaBackwards.jar", forzar)
+    descargar_plugin_github("ViaVersion/ViaVersion", PLUGIN_VIAVERSION, forzar)
+    descargar_plugin_github("ViaVersion/ViaBackwards", PLUGIN_VIABACKWARDS, forzar)
+    # AuthMe: login/registro. Paper build (no Bungee/Velocity/Folia/Spigot).
+    descargar_plugin_github("AuthMe/AuthMeReloaded", PLUGIN_AUTHME, forzar,
+                            preferir="-Paper.jar|AuthMe.jar")
+    configurar_authme()
+    ok(f"Plugins listos: {rango_versiones()} vía ViaVersion/ViaBackwards + login con AuthMe.")
 
 
 # ─── 6. .gitignore y protección de secretos ───────────────────────────────
@@ -544,6 +625,14 @@ def _contenido_gitignore() -> str:
         ".env",
         ".env.*",
         "!.env.example",
+        "id_rsa*",
+        "id_dsa*",
+        "id_ecdsa*",
+        "id_ed25519*",
+        "*.pem",
+        "*.key",
+        "*.p12",
+        "*.pfx",
         "",
         "# Servidor de Minecraft (vive en la raíz del proyecto)",
         "*.jar",
@@ -576,6 +665,7 @@ def _contenido_gitignore() -> str:
         "*.pid",
         "*.lock",
         "*.part",
+        "consola",
         "",
         "# El respaldo comprimido del servidor SÍ se versiona a propósito",
         "# (es la forma de importar el mundo en otro equipo/máquina)",
@@ -808,16 +898,35 @@ def enviar_a_discord(webhook_url: str, mensaje: str) -> bool:
     return False
 
 
+def _version_max_operativa() -> str:
+    """Versión de Minecraft que da el server.jar, leída sin arrancarlo."""
+    v = _version_mc_del_jar()
+    return v if v and v != "desconocida" else "la más reciente"
+
+
+def rango_versiones() -> str:
+    """Rango admitida: la mínima la impone AuthMe, la máxima la del server.jar."""
+    return f"{VER_MINIMA_MC} a {_version_max_operativa()}"
+
+
+def bloque_ip(ip: str, titulo: str = "IP para Minecraft") -> str:
+    """IP dentro de un bloque de código de Discord: sale con recuadro y botón de copiar."""
+    return f"**{titulo}** *(copia y pega)*\n```\n{ip}\n```\n"
+
+
 def _mensaje_activado(direccion: str, puerto: int, motivo_fallo: str = "") -> str:
     if direccion:
-        return ("🎮 **Servidor de Minecraft activo**\n"
-                f"IP: `{direccion}`\n"
-                "Entra con cualquier versión de 1.8 a 1.21: ViaVersion y "
-                "ViaBackwards hacen de traductor.")
-    return ("⚠️ **Servidor de Minecraft arrancado, pero SIN IP pública**\n"
-            f"Puerto local: `{puerto}`\n"
-            f"QuickTunnel falló: {motivo_fallo or 'motivo desconocido'}\n"
-            "Hace falta salida a internet por el puerto 22 para abrir el túnel.")
+        return ("🎮 **Servidor de Minecraft activo**\n\n"
+                + bloque_ip(direccion)
+                + "\n**Versiones:** " + rango_versiones() + " *(ViaVersion y "
+                  "ViaBackwards mantienen el rango al día solos)*\n"
+                  "**Login:** AuthMe — en la primera entrada registras contraseña; "
+                  "después, con `/login`\n"
+                  "**Conexión:** Multijugador → Directo → pega la IP de arriba")
+    return ("⚠️ **Servidor arrancado, pero SIN IP pública**\n\n"
+            f"El túnel no se pudo abrir: {motivo_fallo or 'motivo desconocido'}\n"
+            f"El servidor sí escucha en el puerto local `{puerto}`, pero hace falta "
+            "salida a internet por el puerto 22 para darle IP pública.")
 
 
 def notificar_servidor(webhook: str, direccion: str, puerto: int, motivo_fallo: str = "") -> bool:
@@ -825,6 +934,19 @@ def notificar_servidor(webhook: str, direccion: str, puerto: int, motivo_fallo: 
     if not webhook:
         return False
     return enviar_a_discord(webhook, _mensaje_activado(direccion, puerto, motivo_fallo))
+
+
+def notificar_apagado(webhook: str, direccion: str = "", motivo: str = "") -> bool:
+    """Avisa de que el servidor (y el túnel) se han apagado."""
+    if not webhook:
+        return False
+    lineas = ["🔴 **Servidor de Minecraft apagado**"]
+    if direccion:
+        lineas.append("Esta IP ya no da servicio:")
+        lineas.append("```\n" + direccion + "\n```")
+    if motivo:
+        lineas.append(f"**Motivo:** {motivo}")
+    return enviar_a_discord(webhook, "\n".join(lineas))
 
 
 # ─── 8. Levantar el servidor ─────────────────────────────────────────────
@@ -880,39 +1002,221 @@ def esperar_puerto(puerto: int, proc, timeout: int = TIMEOUT_ARRANQUE, cola=None
         barra.finalizar()
 
 
+def enviar_comando(proc, linea: str) -> bool:
+    """Escribe una orden en la consola del servidor. False si el pipe está roto."""
+    if not linea:
+        return False
+    if proc.stdin is None:
+        return False
+    try:
+        proc.stdin.write(linea + "\n")
+        proc.stdin.flush()
+        return True
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+
+
+def _leer_consola(proc) -> None:
+    """Pasa al servidor lo que se escriba en esta terminal (/op, say, gamemode...).
+
+    Se apoya en select para no bloquear: si no hay nada tecleado, sigue drainage.
+    """
+    while proc.poll() is None:
+        try:
+            listos, _, _ = select.select([sys.stdin], [], [], 0)
+        except (OSError, ValueError):
+            return  # sin terminal (p. ej. entrada desde un fichero): nada que hacer
+        if not listos:
+            continue
+        try:
+            linea = sys.stdin.readline()
+        except (OSError, ValueError, KeyboardInterrupt):
+            return
+        if not linea:
+            return  # stdin cerrado (fin de fichero): deja de escuchar
+        linea = linea.strip()
+        if not linea:
+            continue
+        limpiar_linea()
+        print(f"\n[>] {linea}")
+        if not enviar_comando(proc, linea):
+            aviso("El servidor ya no acepta comandos (proceso terminado).")
+            return
+
+
 def seguir_servidor(proc, cola: queue.Queue):
-    """Muestra la consola del servidor hasta que termine o el usuario interrumpa."""
+    """Muestra la consola del servidor y acepta comandos hasta Ctrl+C."""
     print()
-    print("--- CONSOLA DEL SERVIDOR (Ctrl+C para detener todo) ---")
+    print("--- CONSOLA DEL SERVIDOR ---")
+    print("    Escribe un comando y pulsa Enter (p. ej. op Jugador, say hola, list).")
+    print("    Ctrl+C detiene el servidor y cierra el túnel.")
+    lector = threading.Thread(target=_leer_consola, args=(proc,), daemon=True)
+    lector.start()
     while proc.poll() is None:
         _drenar(cola)
-        time.sleep(0.3)
+        time.sleep(0.2)
     _drenar(cola)
     aviso("El servidor se ha detenido.")
 
 
 # ─── 9. QuickTunnel con barra de carga ────────────────────────────────────
-def cmd_ssh(puerto: int) -> list:
-    """Comando de QuickTunnel: redirige el puerto remoto al local."""
+BARRA_DISCORD = "▓▓▓▓▓▓▓░░░"
+
+
+def _barra_texto(frac: float) -> str:
+    llenos = int(len(BARRA_DISCORD) * frac)
+    return BARRA_DISCORD[:llenos] + BARRA_DISCORD[llenos:]
+
+
+class NotificadorTunel:
+    """Un único mensaje en Discord: 'Iniciando Túnel' + barra, editado cada 10s.
+
+    Se edita el mismo mensaje (PATCH) en vez de enviar uno nuevo cada vez, así el
+    canal no se llena y solo hay una petición cada 10 segundos.
+    """
+
+    def __init__(self, webhook: str, intervalo: int = INTERVALO_AVISO_TUNEL):
+        self.webhook = webhook
+        self.intervalo = intervalo
+        self.id_mensaje = None
+        self.ultimo_envio = 0.0
+
+    def _url_mensaje(self) -> str:
+        return f"{self.webhook}/messages/{self.id_mensaje}"
+
+    def _enviar(self, contenido: str) -> bool:
+        if not self.webhook:
+            return False
+        try:
+            if self.id_mensaje:
+                r = requests.patch(self._url_mensaje(), json={"content": contenido},
+                                   timeout=20)
+                if r.status_code == 404:
+                    # El mensaje ya no existe (cancho borrado): se crea otro.
+                    self.id_mensaje = None
+                    r = requests.post(self.webhook, json={"content": contenido}, timeout=20)
+            else:
+                r = requests.post(self.webhook, json={"content": contenido}, timeout=20)
+        except Exception as e:  # noqa: BLE001
+            error(f"No se pudo avisar a Discord del túnel: {e}")
+            return False
+        if r.status_code in (200, 201, 204):
+            try:
+                datos = r.json()
+                if datos.get("id"):
+                    self.id_mensaje = datos["id"]
+            except ValueError:
+                pass
+            return True
+        if r.status_code == 429:
+            aviso("Discord limita el aviso del túnel (429); se reintentará en la "
+                  "próxima actualización.")
+            return False
+        error(f"Discord rechazó el aviso del túnel: HTTP {r.status_code}")
+        return False
+
+    def iniciar(self, barra: Barra) -> None:
+        if not self.webhook:
+            return
+        self.ultimo_envio = time.time()
+        self._enviar("⏳ **Iniciando Túnel**\nEspere un momento mientras se abre "
+                     "el acceso público al servidor.")
+
+    def pulso(self, barra: Barra) -> None:
+        """Actualiza la barra como mucho cada `intervalo` segundos."""
+        if not self.webhook or self.id_mensaje is None:
+            return
+        ahora = time.time()
+        if ahora - self.ultimo_envio < self.intervalo:
+            return
+        self.ultimo_envio = ahora
+        pct, frac = barra._avance()
+        transcurrido = ahora - barra.inicio
+        restante = max(0, (barra.limite or 0) - transcurrido)
+        self._enviar(f"⏳ **Iniciando Túnel**\n`{_barra_texto(frac)}` {pct:.0f}% · "
+                     f"{transcurrido:.0f}s · ~{restante:.0f}s restantes")
+
+    def finalizar(self, ip: str = "", motivo: str = "") -> None:
+        if not self.webhook or self.id_mensaje is None:
+            return
+        if ip:
+            self._enviar("✅ **Túnel listo**\n\n" + bloque_ip(ip, "IP pública"))
+        else:
+            self._enviar(f"❌ **No se pudo abrir el túnel**\n{motivo}")
+
+
+def asegurar_clave_tunel() -> Path | None:
+    """QuickTunnel exige una clave SSH. Se genera en ~/.ssh (fuera del repo)."""
+    if CLAVE_TUNEL.is_file():
+        try:
+            CLAVE_TUNEL.chmod(0o600)
+        except OSError:
+            pass
+        return CLAVE_TUNEL
+    if not shutil.which("ssh-keygen"):
+        error("Falta ssh-keygen: no se puede crear la clave que exige QuickTunnel.")
+        return None
+    CLAVE_TUNEL.parent.mkdir(parents=True, exist_ok=True)
+    log(f"Generando una clave SSH para QuickTunnel en {CLAVE_TUNEL}...")
+    r = subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "quicktunnel-mc", "-f", str(CLAVE_TUNEL)],
+        capture_output=True, text=True, timeout=60,
+    )
+    if r.returncode != 0 or not CLAVE_TUNEL.is_file():
+        error(f"No se pudo generar la clave: {(r.stderr or '').strip()}")
+        return None
+    try:
+        CLAVE_TUNEL.chmod(0o600)
+    except OSError:
+        pass
+    ok("Clave creada (queda fuera del repositorio, en tu carpeta personal).")
+    return CLAVE_TUNEL
+
+
+def cmd_ssh(puerto: int, host: str = None, clave: Path = None) -> list:
+    """Comando de QuickTunnel: redirige el puerto remoto al local.
+
+    Sin -N a propósito: la URL pública llega por la sesión de shell del servidor,
+    y con -N nunca se recibe. -T evita la pseudo-terminal (salida sin ANSI).
+    """
     return [
-        "ssh", "-N",
+        "ssh", "-T",
+        "-i", str(clave or CLAVE_TUNEL),
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ExitOnForwardFailure=yes",
         "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=3",
         "-R", f"{PUERTO_TUNEL}:localhost:{puerto}",
-        QUICKTUNNEL_HOST,
+        f"{QUICKTUNNEL_USUARIO}@{host or QUICKTUNNEL_HOST}",
     ]
+
+
+def _host_valido(host: str) -> bool:
+    if not host or host.lower() in HOSTS_NO_TUNEL:
+        return False
+    etiquetas = host.lower().split(".")
+    if any(e in ("admin", "docs", "faq", "status", "blog", "www") for e in etiquetas[:-1]):
+        return False
+    return len(etiquetas) >= 3
 
 
 def buscar_url(texto: str) -> str:
     """Extrae el host público del túnel de una línea de salida de ssh."""
-    m = RE_URL_TUNEL.search(texto) or RE_URL_CUALQUIERA.search(texto)
-    return m.group(1) if m else ""
+    m = RE_TUNEL_MARCADO.search(texto)
+    if m:
+        host = re.sub(r"^https?://", "", m.group(1)).split("/")[0]
+        if _host_valido(host):
+            return host
+    for patron in (RE_URL_TUNEL, RE_URL_CUALQUIERA):
+        for candidato in patron.findall(texto):
+            if _host_valido(candidato):
+                return candidato
+    return ""
 
 
-def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL) -> tuple:
+def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL,
+                        notificador=None) -> tuple:
     """Lanza QuickTunnel vía SSH y devuelve (direccion_mc, proceso).
 
     Muestra una barra de carga mientras espera la URL pública.
@@ -920,16 +1224,21 @@ def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL) -
     if not comprobar_ssh():
         error("No se encontró 'ssh' en el PATH. Instala openssh-client para usar QuickTunnel.")
         return "", None
-    cmd = cmd_ssh(puerto)
+    clave = asegurar_clave_tunel()
+    if clave is None:
+        return "", None
+    cmd = cmd_ssh(puerto, clave=clave)
     cola: queue.Queue = queue.Queue()
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
     except FileNotFoundError:
         error("No se pudo ejecutar ssh.")
         return "", None
     threading.Thread(target=_bombeo_salida, args=(proc, cola), daemon=True).start()
     barra = Barra(f"Levantando QuickTunnel ({QUICKTUNNEL_HOST})", limite=timeout)
+    if notificador:
+        notificador.iniciar(barra)
     host_publico = None
     terminado = False
     try:
@@ -941,6 +1250,8 @@ def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL) -
                 linea = cola.get(timeout=0.1)
             except queue.Empty:
                 barra.refrescar()
+                if notificador:
+                    notificador.pulso(barra)
                 continue
             if linea is None:
                 terminado = True
@@ -958,14 +1269,18 @@ def iniciar_quicktunnel(puerto: int = PUERTO_MC, timeout: int = TIMEOUT_TUNEL) -
     if not host_publico:
         global MOTIVO_FALLO_TUNEL
         if terminado:
-            MOTIVO_FALLO_TUNEL = ("el proceso de ssh murió sin dar la URL "
+            MOTIVO_FALLO_TUNEL = ("ssh no llegó a dar la URL "
                                   f"(¿salida al puerto 22 de {QUICKTUNNEL_HOST}?)")
         else:
             MOTIVO_FALLO_TUNEL = f"no respondió en {timeout}s"
+        if notificador:
+            notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL)
         error(f"No se obtuvo la URL de QuickTunnel: {MOTIVO_FALLO_TUNEL}")
         _detener_proceso(proc, escribir_stop=False, timeout=5)
         return "", None
     direccion_mc = f"{host_publico}:{PUERTO_TUNEL}"
+    if notificador:
+        notificador.finalizar(ip=direccion_mc)
     ok(f"Dirección para Minecraft: {direccion_mc}")
     return direccion_mc, proc
 
@@ -1040,14 +1355,59 @@ def _abrir_log(ruta: Path):
 def url_en_log(ruta: Path) -> str:
     """Última URL de túnel que aparece en el log de ssh."""
     try:
-        texto = ruta.read_text(errors="replace")
+        texto = _sin_ansi(ruta.read_text(errors="replace"))
     except OSError:
         return ""
-    for patron in (RE_URL_TUNEL, RE_URL_CUALQUIERA):
-        encontrados = patron.findall(texto)
-        if encontrados:
-            return encontrados[-1]
-    return ""
+    return buscar_url(texto)
+
+
+CODIGO_PUENTE_CONSOLA = """
+import os, sys
+fd = int(sys.argv[1])
+fifo = sys.argv[2]
+while True:
+    try:
+        with open(fifo, "r") as f:
+            for linea in f:
+                linea = linea.strip()
+                if linea:
+                    os.write(fd, (linea + "\\n").encode())
+    except Exception:
+        pass
+"""
+
+
+def asegurar_fifo_consola() -> bool:
+    """Crea el FIFO 'consola' para mandar comandos al servidor desacoplado."""
+    try:
+        if FIFO_CONSOLA.exists():
+            if stat.S_ISFIFO(os.stat(FIFO_CONSOLA).st_mode):
+                return True
+            FIFO_CONSOLA.unlink()
+        os.mkfifo(FIFO_CONSOLA, 0o600)
+        return True
+    except OSError as e:
+        aviso(f"No se pudo crear el FIFO de consola: {e}")
+        return False
+
+
+def _lanzar_puente_consola(proc) -> None:
+    """Proceso ayudante que lee el FIFO y lo vuelca en el stdin del servidor.
+
+    Necesita close_fds=False para heredar el extremo de escritura del pipe:
+    así, aunque este script termine, el servidor no se queda sin stdin.
+    """
+    if proc.stdin is None or not asegurar_fifo_consola():
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", CODIGO_PUENTE_CONSOLA,
+             str(proc.stdin.fileno()), str(FIFO_CONSOLA)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=False, start_new_session=True,
+        )
+    except OSError as e:
+        aviso(f"No se pudo abrir el canal de comandos: {e}")
 
 
 def arrancar_servidor_detached(puerto: int):
@@ -1056,7 +1416,7 @@ def arrancar_servidor_detached(puerto: int):
     mango = _abrir_log(LOG_SERVIDOR)
     try:
         proc = subprocess.Popen(
-            cmd_servidor(puerto), cwd=str(SERVER_DIR), stdin=subprocess.DEVNULL,
+            cmd_servidor(puerto), cwd=str(SERVER_DIR), stdin=subprocess.PIPE,
             stdout=mango, stderr=subprocess.STDOUT, start_new_session=True,
         )
     except FileNotFoundError:
@@ -1064,20 +1424,24 @@ def arrancar_servidor_detached(puerto: int):
     finally:
         mango.close()
     PID_SERVIDOR.write_text(f"{proc.pid}\n")
+    _lanzar_puente_consola(proc)
     return proc
 
 
-def iniciar_tunel_detached(puerto: int, timeout: int = TIMEOUT_TUNEL) -> tuple:
+def iniciar_tunel_detached(puerto: int, timeout: int = TIMEOUT_TUNEL, notificador=None) -> tuple:
     """QuickTunnel desacoplado. La URL se lee del log porque no hay tubería."""
     global MOTIVO_FALLO_TUNEL
     MOTIVO_FALLO_TUNEL = ""
-    cmd = cmd_ssh(puerto)
+    clave = asegurar_clave_tunel()
+    if clave is None:
+        raise RuntimeError("QuickTunnel necesita una clave SSH y no se pudo generar.")
+    cmd = cmd_ssh(puerto, clave=clave)
     if shutil.which("stdbuf"):
         cmd = ["stdbuf", "-oL", "-eL", *cmd]
     mango = _abrir_log(LOG_TUNEL)
     try:
         proc = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=mango, stderr=subprocess.STDOUT,
+            cmd, stdin=subprocess.PIPE, stdout=mango, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
     except FileNotFoundError:
@@ -1086,25 +1450,36 @@ def iniciar_tunel_detached(puerto: int, timeout: int = TIMEOUT_TUNEL) -> tuple:
         mango.close()
     PID_TUNEL.write_text(f"{proc.pid}\n")
     barra = Barra(f"Levantando QuickTunnel ({QUICKTUNNEL_HOST})", limite=timeout)
+    if notificador:
+        notificador.iniciar(barra)
     try:
         while time.time() - barra.inicio < timeout:
             if proc.poll() is not None:
                 barra.finalizar()
-                detalle = LOG_TUNEL.read_text(errors="replace").strip() if LOG_TUNEL.is_file() else ""
+                detalle = (_sin_ansi(LOG_TUNEL.read_text(errors="replace")).strip()
+                           if LOG_TUNEL.is_file() else "")
                 MOTIVO_FALLO_TUNEL = (detalle[-200:] or "el proceso de ssh murió sin salida")
+                if notificador:
+                    notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL)
                 error(f"QuickTunnel terminó antes de dar la URL:\n{MOTIVO_FALLO_TUNEL}")
                 _limpiar_pid(PID_TUNEL)
                 return "", None
             host = url_en_log(LOG_TUNEL)
             if host:
                 barra.finalizar("QuickTunnel activo")
+                if notificador:
+                    notificador.finalizar(ip=f"{host}:{PUERTO_TUNEL}")
                 return f"{host}:{PUERTO_TUNEL}", proc
             barra.refrescar()
+            if notificador:
+                notificador.pulso(barra)
             time.sleep(0.2)
         barra.finalizar()
-        MOTIVO_FALLO_TUNEL = (f"sin salida a internet por el puerto 22 de {QUICKTUNNEL_HOST} "
-                              f"o el servicio no respondió en {timeout}s")
-        error(f"No se obtuvo la URL de QuickTunnel en {timeout} segundos: {MOTIVO_FALLO_TUNEL}")
+        MOTIVO_FALLO_TUNEL = (f"sin respuesta de {QUICKTUNNEL_HOST} en {timeout}s "
+                              f"(¿salida a internet por el puerto 22?)")
+        if notificador:
+            notificador.finalizar(motivo=MOTIVO_FALLO_TUNEL)
+        error(f"No se obtuvo la URL de QuickTunnel: {MOTIVO_FALLO_TUNEL}")
         _matar_pid(proc.pid)
         _limpiar_pid(PID_TUNEL)
         return "", None
@@ -1138,9 +1513,16 @@ def modo_notificacion(args) -> int:
         if not esperar_puerto(args.puerto, proc_srv):
             error("El servidor no abrió el puerto a tiempo.")
             return 1
+        configurar_authme()  # la config de AuthMe existe tras el primer arranque
         ok(f"Servidor en segundo plano (PID {proc_srv.pid}, log: {LOG_SERVIDOR}).")
 
-    # 2. Túnel
+    # 2. Discord (se carga antes del túnel: el progreso se manda mientras abre)
+    webhook = obtener_webhook()
+    notificador = None
+    if webhook and not args.sin_notificar_tunel:
+        notificador = NotificadorTunel(webhook)
+
+    # 3. Túnel
     direccion = ""
     pid_tunel = _leer_pid(PID_TUNEL)
     if _vivo(pid_tunel):
@@ -1153,15 +1535,14 @@ def modo_notificacion(args) -> int:
         if args.sin_tunnel:
             aviso("QuickTunnel omitido (--sin-tunnel): la IP no será pública.")
         else:
-            direccion, _proc = iniciar_tunel_detached(args.puerto)
+            direccion, _proc = iniciar_tunel_detached(args.puerto, notificador=notificador)
             if direccion:
                 if comprobar_tunel(direccion.rsplit(":", 1)[0]):
                     ok("Túnel verificado: el puerto público responde.")
                 else:
                     aviso("El túnel aún no responde; puede tardar unos segundos más.")
 
-    # 3. Discord (siempre: con la IP o con el motivo del fallo)
-    webhook = obtener_webhook()
+    # 4. Aviso con la IP (o con el motivo del fallo)
     notificar_servidor(webhook, direccion, args.puerto, MOTIVO_FALLO_TUNEL)
 
     # 4. Panel con cómo pararlo
@@ -1170,10 +1551,13 @@ def modo_notificacion(args) -> int:
     print("  SERVIDOR Y TÚNEL EN SEGUNDO PLANO")
     print("=" * 62)
     print(f"  IP pública    : {direccion or '(sin túnel)'}")
+    print(f"  Versiones     : {rango_versiones()}  (ViaVersion + ViaBackwards)")
+    print("  Login         : AuthMe  (regístrate la primera vez, luego /login)")
     print(f"  Servidor PID  : {_leer_pid(PID_SERVIDOR) or '?'}   (log: {LOG_SERVIDOR})")
     print(f"  Túnel PID     : {_leer_pid(PID_TUNEL) or '?'}   (log: {LOG_TUNEL})")
     print()
     print("  Ver la consola  :  tail -f logs/servidor.log")
+    print("  Mandar comando  :  echo 'op Jugador' > consola   (o 'say hola', 'list'...)")
     print("  Cerrar túnel    :  kill $(cat tunel.pid)    # la IP deja de servir")
     print("  Parar servidor  :  kill $(cat servidor.pid)")
     print("=" * 62)
@@ -1199,7 +1583,7 @@ BACKUP_INCLUYE = ["server.jar", "world", "plugins", "config", ".paper",
                   "server.properties", "eula.txt", "ops.json", "whitelist.json",
                   "banned-players.json", "banned-ips.json", "usercache.json",
                   "bukkit.yml", "spigot.yml", "commands.yml"]
-BACKUP_EXCLUYE = [".env", ".env.*", ".git", "*.pid", "*.log", "*.part",
+BACKUP_EXCLUYE = [".env", ".env.*", ".git", "*.pid", "*.log", "*.part", "consola",
                   "libraries", "cache", "respaldo", "__pycache__"]
 TAMANO_ADVERTENCIA = 50 * 1024 * 1024
 TAMANO_MAXIMO = 100 * 1024 * 1024
@@ -1328,12 +1712,17 @@ def _empaquetar(destino: Path, manifiesto: dict, incluir: list) -> tuple:
     with tempfile.TemporaryDirectory() as tmp:
         man_tmp = Path(tmp) / MANIFIESTO
         man_tmp.write_text(json.dumps(manifiesto, indent=2) + "\n")
-        cmd = ["tar", "-I", " ".join(compresor), "-cf", "-", "--ignore-failed-read"]
+        cmd = ["tar", "-I", " ".join(compresor), "-cf", "-", "--ignore-failed-read",
+               # El mundo cambia mientras se empaqueta si el servidor está vivo:
+               # eso son avisos, no errores.
+               "--warning=no-file-changed", "--warning=no-file-removed"]
         for patron in BACKUP_EXCLUYE:
             cmd += ["--exclude", patron]
         cmd += ["-C", tmp, MANIFIESTO, "-C", str(SERVER_DIR), *incluir]
-        with open(temporal, "wb") as f:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stderr a fichero: si lo dejáramos en una tubería y tar escribiese mucho
+        # se llenaría y se quedaría bloqueado esperándonos.
+        with tempfile.TemporaryFile() as errf, open(temporal, "wb") as f:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
             barra = Barra(f"Comprimiendo {destino.name}", total=None)
             inicio = time.time()
             total = 0
@@ -1344,12 +1733,21 @@ def _empaquetar(destino: Path, manifiesto: dict, incluir: list) -> tuple:
                 f.write(trozo)
                 total += len(trozo)
                 barra.avanzar(len(trozo))
-            err = proc.stderr.read().decode(errors="replace")
+            proc.stdout.close()
             rc = proc.wait()
+            errf.seek(0)
+            err = errf.read().decode(errors="replace").strip()
         if rc != 0:
             temporal.unlink(missing_ok=True)
             barra.finalizar()
-            raise RuntimeError(f"tar falló: {err.strip()[:200]}")
+            if rc < 0:
+                raise RuntimeError(
+                    f"tar terminó por la señal {-rc} "
+                    f"({signal.Signals(-rc).name}). ¿Lo mataste con pkill/ kill?")
+            if rc == 1 and err:
+                aviso(f"tar avisó (no es fatal): {err.strip()[:200]}")
+            else:
+                raise RuntimeError(f"tar falló (código {rc}): {err.strip()[:200] or '(sin salida)'}")
     temporal.replace(destino)
     barra.finalizar(f"{total / 1048576:,.1f} MB en {time.time() - inicio:.0f}s")
     return total, time.time() - inicio
@@ -1672,6 +2070,8 @@ def parse_args():
                    help="Respaldo sin server.jar (~7 MB en vez de ~68 MB)")
     p.add_argument("--solo-notificar", action="store_true",
                    help="Deja servidor y túnel en segundo plano, avisa a Discord y sube a Git")
+    p.add_argument("--sin-notificar-tunel", action="store_true",
+                   help="No mandar a Discord la barra de progreso del túnel")
     p.add_argument("--probar-webhook", action="store_true",
                    help="Manda un mensaje de prueba a Discord y sale")
     p.add_argument("--crear-nuevo", action="store_true",
@@ -1772,15 +2172,24 @@ def main():
             error(str(e))
             return 1
 
+    webhook = ""
+    notificador = None
+    motivo_apagado = "el script terminó"
+    if not args.sin_notificar_tunel:
+        webhook = obtener_webhook()
+        if webhook:
+            notificador = NotificadorTunel(webhook)
+
     try:
         # 2. Servidor en marcha
         servidor_proc, cola = arrancar_servidor(args.puerto)
         if not esperar_puerto(args.puerto, servidor_proc, cola=cola):
             raise RuntimeError(f"El servidor no abrió el puerto {args.puerto} a tiempo.")
+        configurar_authme()  # la config de AuthMe existe tras el primer arranque
 
         # 3. Túnel con barra de carga
         if not args.sin_tunnel:
-            direccion, tunel_proc = iniciar_quicktunnel(args.puerto)
+            direccion, tunel_proc = iniciar_quicktunnel(args.puerto, notificador=notificador)
             if direccion:
                 host = direccion.rsplit(":", 1)[0]
                 if comprobar_tunel(host):
@@ -1793,7 +2202,6 @@ def main():
         listo_para_subir = True
 
         # 4. Discord (siempre: con la IP o con el motivo del fallo)
-        webhook = obtener_webhook()
         motivo = MOTIVO_FALLO_TUNEL
         if args.sin_tunnel:
             motivo = "QuickTunnel omitido con --sin-tunnel"
@@ -1807,21 +2215,27 @@ def main():
         print(f"  Ruta local   : {SERVER_DIR}")
         print(f"  Puerto local : {args.puerto}")
         print(f"  Dirección MC : {direccion or '(sin túnel)'}")
+        print(f"  Versiones    : {rango_versiones()}  (ViaVersion + ViaBackwards)")
+        print("  Login        : AuthMe  (regístrate la primera vez, luego /login)")
         print("  Presiona Ctrl+C para detener el servidor y cerrar el túnel.")
         print()
 
         # 6. Consola en primer plano
         seguir_servidor(servidor_proc, cola)
     except KeyboardInterrupt:
-        aviso("Interrumpido por el usuario.")
+        aviso("Interrumpido por el usuario (Ctrl+C).")
+        motivo_apagado = "el usuario lo detuvo con Ctrl+C"
     except Exception as e:  # noqa: BLE001
         error(str(e))
         codigo = 1
+        motivo_apagado = str(e)
     finally:
         if servidor_proc is not None:
             log("Deteniendo el servidor...")
             _detener_proceso(servidor_proc)
         detener_tunel(tunel_proc)
+        if servidor_proc is not None:
+            notificar_apagado(webhook, direccion, motivo_apagado)
         if args.sin_push:
             aviso("Push omitido (--sin-push).")
         elif listo_para_subir:
