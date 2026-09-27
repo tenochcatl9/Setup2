@@ -474,7 +474,7 @@ def generar_plugins_dir(timeout_arranque: int = TIMEOUT_ARRANQUE):
         if not args_sin_backup_auto():
             if arrancar_backups_auto():
                 log(f"Respaldo automático cada {BACKUP_AUTO_MINUTOS} min en "
-                    f"respaldo/auto/ (se guardan los {BACKUP_AUTO_MANTENER} últimos).")
+                    f"respaldo/ (se guardan los {BACKUP_AUTO_MANTENER} últimos).")
     finally:
         _detener_proceso(proc, escribir_stop=True)
         log("Servidor detenido.")
@@ -794,10 +794,11 @@ def _contenido_gitignore() -> str:
         "# (es la forma de importar el mundo en otro equipo/máquina)",
         "!respaldo/",
         "!respaldo/**",
-        # Los respaldos automáticos (cada 20 min) son solo locales: unos 45 MB
-        # cada 20 min meterían ~3 GB al día en el historial. El que se
-        # versiona es respaldo/servidor-mc.tar.zst, que se regenera al parar.
-        "respaldo/auto/",
+        # Los automáticos (cada 20 min) son solo locales: ~130 MB cada vez y
+        # no deben entrar al historial. El tarball del mundo se versiona
+        # mientras quepa en git; si no cabe, se publica como release y esta
+        # misma línea se añade aquí sola hasta que vuelva a caber.
+        "respaldo/mundo-*.tar.zst",
         "",
         "# Python",
         "__pycache__/",
@@ -1108,7 +1109,7 @@ def arrancar_servidor(puerto: int):
     if not args_sin_backup_auto():
         if arrancar_backups_auto(puerto=puerto):
             log(f"Respaldo automático cada {BACKUP_AUTO_MINUTOS} min en "
-                f"respaldo/auto/ (se guardan los {BACKUP_AUTO_MANTENER} últimos).")
+                f"respaldo/ (se guardan los {BACKUP_AUTO_MANTENER} últimos).")
     return proc, cola
 
 
@@ -2211,7 +2212,7 @@ def modo_notificacion(args) -> int:
         print(f"  Servicio      : {PROVEEDORES[proveedor_usado]['nombre']}")
     print(f"  Versiones     : {rango_versiones()}  (ViaVersion + ViaBackwards)")
     print(f"  Skins         : SkinsRestorer {version_skinsrestorer()}  (se actualiza al correr)")
-    print(f"  Respaldo auto : cada {BACKUP_AUTO_MINUTOS} min en respaldo/auto/ "
+    print(f"  Respaldo auto : cada {BACKUP_AUTO_MINUTOS} min en respaldo/ "
           f"({BACKUP_AUTO_MANTENER} últimos, sin parar el servidor)")
     print("  Login         : AuthMe  (regístrate la primera vez, luego /login)")
     print(f"  Servidor PID  : {_leer_pid(PID_SERVIDOR) or '?'}   (log: {LOG_SERVIDOR})")
@@ -2346,7 +2347,10 @@ def _respaldo_sigue_vigente(hash_contenido: str) -> bool:
 
 RE_RAW = re.compile(r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(.+)$", re.I)
 RE_REPO = re.compile(r"^([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
-RE_GITHUB = re.compile(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)", re.I)
+# Solo "owner/repo" a secas: una URL de release
+# (.../releases/download/world/...) tiene más segmentos y debe tratarse como
+# descarga directa, no como repositorio (si no, busca el tarball en la rama).
+RE_GITHUB = re.compile(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", re.I)
 NOMBRES_RESPALDO = ("respaldo/servidor-mc.tar.zst", "respaldo/servidor-mc.tar.gz")
 
 
@@ -2465,7 +2469,7 @@ def _hash_contenido(directorio: Path, incluir: list) -> tuple:
 # se congela el mundo con save-off/save-all flush y se descongela al terminar.
 BACKUP_AUTO_MINUTOS = 20
 BACKUP_AUTO_MANTENER = 4          # cuántos respaldos automáticos se conservan
-DIR_BACKUP_AUTO = SERVER_DIR / "respaldo" / "auto"
+DIR_BACKUP_AUTO = RESPALDO_DIR   # van junto al resto, en respaldo/
 _HILO_BACKUPS = None
 
 
@@ -2582,12 +2586,12 @@ def respaldo_automatico(puerto: int = 25565) -> bool:
             destino.unlink(missing_ok=True)
             error("El respaldo automático traía ficheros sensibles; se borra.")
             return False
-        ok(f"Respaldo automático: respaldo/auto/{destino.name} "
+        ok(f"Respaldo automático: respaldo/{destino.name} "
            f"({destino.stat().st_size / 1048576:,.0f} MB)")
         _purgar_backups_auto()
         _avisar_backup(
             "**Respaldo automático hecho**\n"
-            f"`respaldo/auto/{destino.name}` — "
+            f"`respaldo/{destino.name}` — "
             f"{destino.stat().st_size / 1048576:,.0f} MB\n"
             f"Se sigue haciendo uno cada {BACKUP_AUTO_MINUTOS} min sin parar el "
             f"servidor (se guardan los {BACKUP_AUTO_MANTENER} últimos).")
@@ -2711,14 +2715,27 @@ def publicar_mundo(ruta: Path) -> str:
     return url_mundo()
 
 
-def _despublicar_respaldo() -> None:
-    """Deja de versionar el tarball: a partir de aquí vive en la release."""
+MARCA_MUNDO_EN_RELEASE = ("# mundo en la release (no cabe en git); "
+                          "se quita solo en cuanto vuelve a caber")
+
+
+def _en_release(activo: bool) -> None:
+    """Ignora el tarball del mundo solo mientras vive en la release.
+
+    No se deja puesto para siempre: en cuanto el mundo vuelve a caber en git (por
+    ejemplo tras vaciar el mundo), se quita la línea y se vuelve a versionar.
+    """
     rel = _relativo(_paquete_respaldo())
-    _git(["rm", "--cached", "-q", "-f", rel])
-    if not GITIGNORE_FILE.read_text().count(f"\n{rel}\n"):
-        bloque = (f"\n# El mundo ya no cabe en git (>100 MB): vive en la release\n"
-                  f"# {RELEASE_MUNDO}, con URL estable. Ver setup_mc.py.\n{rel}\n")
-        GITIGNORE_FILE.write_text(GITIGNORE_FILE.read_text() + bloque)
+    lineas = [l for l in GITIGNORE_FILE.read_text().splitlines()
+              if l.strip() != rel and l.strip() != MARCA_MUNDO_EN_RELEASE]
+    if activo:
+        lineas += ["", MARCA_MUNDO_EN_RELEASE, rel]
+        # Y sale del índice: si se quedara versionado, el push lo rechazaría
+        # GitHub por pasar de 100 MB.
+        _git(["rm", "--cached", "-q", "-f", rel])
+    GITIGNORE_FILE.write_text("\n".join(lineas).rstrip("\n") + "\n")
+    if not activo:
+        _git(["add", "-f", rel])
 
 def _empaquetar(destino: Path, manifiesto: dict, incluir: list,
                 total_esperado: int | None = None) -> tuple:
@@ -2865,14 +2882,16 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
         except (RuntimeError, requests.RequestException) as e:
             RESPALDO_ACTUAL.unlink(missing_ok=True)
             error(f"No se pudo publicar el mundo en la release: {e}")
-            log("    Se deja el respaldo solo en disco, en respaldo/auto/.")
+            log("    Se deja el respaldo solo en disco, en respaldo/.")
             return False
-        _despublicar_respaldo()
+        _en_release(True)
         ok(f"Mundo publicado en la release: {enlace}")
         log("    Esa URL no cambia: siempre da el mundo más reciente, y el")
         log("    import la baja automáticamente si el repositorio no lo trae.")
         RESPALDO_ACTUAL = None
         return True
+    # Si antes vivía en la release y ya cabe, se vuelve a meter en git.
+    _en_release(False)
     ok(f"Respaldo listo: {_relativo(RESPALDO_ACTUAL)} "
        f"(MC {manifiesto['minecraft']}, {archivos} archivos, "
        f"{'con' if con_jar else 'sin'} server.jar)")
@@ -3081,16 +3100,20 @@ def preguntar_crear_o_importar() -> str:
 
 
 def preguntar_url_respaldo() -> str:
+    """Pide de dónde sacar el mundo. Viene con la URL ya puesta."""
     print()
-    print("  Formatos aceptados:")
-    print("    - owner/repo                     (p. ej. tenochcatl9/Setup2)")
-    print("    - https://github.com/owner/repo")
-    print("    - URL directa a un .tar.zst / .tar.gz")
+    print("  Si el mundo no cabe en git se publica como release, y esta es la")
+    print("  dirección (no cambia nunca, siempre da el mundo más reciente):")
+    print("    - owner/repo        p. ej. tenochcatl9/Setup2")
+    print("    - URL del repo      https://github.com/owner/repo")
+    print("    - URL directa       .../releases/download/world/servidor-mc.tar.zst")
+    por_defecto = url_mundo() or NOMBRES_RESPALDO[0]
     try:
-        return input("  URL o owner/repo del respaldo: ").strip()
+        respuesta = input(f"  URL o owner/repo [{por_defecto}]: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return ""
+    return respuesta or por_defecto
 
 
 # ─── 14. Commit y push a la rama principal ───────────────────────────────
@@ -3228,6 +3251,12 @@ def preparar_servidor(args) -> bool:
                 error(f"No se pudo importar: {e}")
                 return False
             nuevo = False
+            # El mundo grande se publica sin server.jar (pesaba demasiado), así
+            # que tras importar puede no haber servidor. Sin esto, una cuenta
+            # nueva se queda con el mundo importado pero sin nada que arranque.
+            if not SERVER_JAR.is_file():
+                aviso("El respaldo no traía server.jar; se descarga Paper.")
+                descargar_paper()
         else:
             descargar_paper()
     else:

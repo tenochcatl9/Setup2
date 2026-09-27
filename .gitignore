@@ -49,7 +49,7 @@ consola
 # (es la forma de importar el mundo en otro equipo/máquina)
 !respaldo/
 !respaldo/**
-respaldo/auto/
+respaldo/mundo-*.tar.zst
 
 # Python
 __pycache__/
@@ -64,6 +64,7 @@ env/
 .DS_Store
 # <<< FIN bloque gestionado por setup_mc.py <<<
 
-# El mundo ya no cabe en git (>100 MB): vive en la release
-# world, con URL estable. Ver setup_mc.py.
+
+
+# mundo en la release (no cabe en git); se quita solo en cuanto vuelve a caber
 respaldo/servidor-mc.tar.zst
