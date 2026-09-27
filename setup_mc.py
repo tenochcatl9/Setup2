@@ -2606,6 +2606,93 @@ def arrancar_backups_auto(intervalo_min: int = BACKUP_AUTO_MINUTOS,
     _HILO_BACKUPS.start()
     return True
 
+# ─── El mundo, cuando ya no cabe en git: release rodante de GitHub ──────
+# GitHub no admite blobs de más de 100 MB, y el mundo crece sin parar. En
+# cuanto el tarball se pasa, en vez de dejar de respaldar se sube a una
+# release con etiqueta fija: la URL no cambia nunca y el import ya sabe
+# bajarla. Así el mundo vive fuera del historial y .git deja de crecer.
+RELEASE_MUNDO = "world"
+ASSET_MUNDO = "servidor-mc.tar.zst"
+LIMITE_ASSET_RELEASE = 1900 * 1024 * 1024      # tope por asset de una release
+
+
+def _slug_repo() -> str:
+    """owner/repo del remoto origin, para las llamadas a la API."""
+    url = _git(["remote", "get-url", "origin"]).stdout.strip()
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/.]+)(?:\.git)?$", url)
+    return f"{m.group(1)}/{m.group(2)}" if m else ""
+
+
+def _api_github(metodo: str, url: str, **kw):
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    cabeceras = {"Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        cabeceras["Authorization"] = f"Bearer {token}"
+    cabeceras.update(kw.pop("headers", {}))
+    return requests.request(metodo, url, headers=cabeceras, timeout=kw.pop("timeout", 180),
+                            **kw)
+
+
+def url_mundo() -> str:
+    """URL estable y pública del último mundo publicado."""
+    slug = _slug_repo()
+    return (f"https://github.com/{slug}/releases/download/{RELEASE_MUNDO}/{ASSET_MUNDO}"
+            if slug else "")
+
+
+def publicar_mundo(ruta: Path) -> str:
+    """Sube (o reemplaza) el tarball del mundo en la release rodante.
+
+    Devuelve la URL de descarga. Lanza RuntimeError si no puede.
+    """
+    slug = _slug_repo()
+    if not slug:
+        raise RuntimeError("No se pudo deducir el repositorio del remoto origin.")
+    if not (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")):
+        raise RuntimeError("Falta GITHUB_TOKEN en el entorno.")
+    tam = ruta.stat().st_size
+    if tam > LIMITE_ASSET_RELEASE:
+        raise RuntimeError(
+            f"El respaldo pesa {tam / 1048576:,.0f} MB y una release de GitHub "
+            f"acepta {LIMITE_ASSET_RELEASE // 1048576:,.0f} MB por asset.")
+    base = f"https://api.github.com/repos/{slug}"
+    datos = {"tag_name": RELEASE_MUNDO,
+             "name": "Mundo del servidor (se actualiza solo)",
+             "body": "Se sobrescribe en cada respaldo: esta URL siempre da el "
+                     "mundo más reciente. Para restaurarlo, `python3 setup_mc.py` "
+                     "y luego importar con esta dirección.",
+             "draft": False, "prerelease": False}
+    r = _api_github("POST", f"{base}/releases", json=datos)
+    if r.status_code in (201, 422):        # 422 = ya existe esa etiqueta
+        r = _api_github("GET", f"{base}/releases/tags/{RELEASE_MUNDO}")
+        r.raise_for_status()
+        id_release = r.json()["id"]
+        # Se borra el asset anterior: si no, se acumulan uno a uno.
+        for asset in _api_github("GET", f"{base}/releases/{id_release}/assets").json():
+            if asset.get("name") == ASSET_MUNDO:
+                _api_github("DELETE", f"{base}/releases/assets/{asset['id']}")
+    else:
+        r.raise_for_status()
+        id_release = r.json()["id"]
+    r = _api_github("POST",
+                    f"https://uploads.github.com/repos/{slug}/releases/{id_release}/assets"
+                    f"?name={ASSET_MUNDO}",
+                    data=ruta.read_bytes(),
+                    headers={"Content-Type": "application/octet-stream"})
+    r.raise_for_status()
+    return url_mundo()
+
+
+def _despublicar_respaldo() -> None:
+    """Deja de versionar el tarball: a partir de aquí vive en la release."""
+    rel = _relativo(_paquete_respaldo())
+    _git(["rm", "--cached", "-q", "-f", rel])
+    if not GITIGNORE_FILE.read_text().count(f"\n{rel}\n"):
+        bloque = (f"\n# El mundo ya no cabe en git (>100 MB): vive en la release\n"
+                  f"# {RELEASE_MUNDO}, con URL estable. Ver setup_mc.py.\n{rel}\n")
+        GITIGNORE_FILE.write_text(GITIGNORE_FILE.read_text() + bloque)
+
 def _empaquetar(destino: Path, manifiesto: dict, incluir: list,
                 total_esperado: int | None = None) -> tuple:
     """Escribe el tar comprimido con el manifiesto dentro. Devuelve (bytes, segundos).
@@ -2740,18 +2827,25 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
               f"{TAMANO_ADVERTENCIA // 1048576} MB; por encima de "
               f"{TAMANO_MAXIMO // 1048576} MB ya no se puede subir.")
     if tam > TAMANO_MAXIMO:
-        # El mundo en sí ya no cabe en git aunque se quite server.jar.
-        RESPALDO_ACTUAL.unlink(missing_ok=True)
-        error(f"El respaldo llega a {tam / 1048576:,.0f} MB incluso sin server.jar "
-              f"y GitHub no acepta archivos de más de {TAMANO_MAXIMO // 1048576} MB: "
-              "no se sube nada.")
-        log("    El mundo ha crecido demasiado para vivir en el repositorio. Opciones:")
-        log("      - respaldar el mundo aparte (Drive, Backblaze, S3) y dejar aquí")
-        log("        solo plugins/ y config/;")
-        log("      - publicar el tarball como release de GitHub y compartir el enlace")
-        log("        (el import ya acepta una URL directa);")
-        log("      - seguir sin respaldar con --sin-respaldo mientras tanto.")
-        return False
+        # El mundo ya no cabe en git. Se va a una release rodante con URL fija
+        # en vez de dejar de respaldar, y se deja de versionar para que .git
+        # no siga engordando con el mundo.
+        aviso(f"El respaldo llega a {tam / 1048576:,.0f} MB y GitHub no acepta "
+              f"blobs de más de {TAMANO_MAXIMO // 1048576} MB: se publica como "
+              "release en lugar de subirse al repositorio.")
+        try:
+            enlace = publicar_mundo(RESPALDO_ACTUAL)
+        except (RuntimeError, requests.RequestException) as e:
+            RESPALDO_ACTUAL.unlink(missing_ok=True)
+            error(f"No se pudo publicar el mundo en la release: {e}")
+            log("    Se deja el respaldo solo en disco, en respaldo/auto/.")
+            return False
+        _despublicar_respaldo()
+        ok(f"Mundo publicado en la release: {enlace}")
+        log("    Esa URL no cambia: siempre da el mundo más reciente, y el")
+        log("    import la baja automáticamente si el repositorio no lo trae.")
+        RESPALDO_ACTUAL = None
+        return True
     ok(f"Respaldo listo: {_relativo(RESPALDO_ACTUAL)} "
        f"(MC {manifiesto['minecraft']}, {archivos} archivos, "
        f"{'con' if con_jar else 'sin'} server.jar)")
@@ -2882,7 +2976,30 @@ def _extraer_respaldo(origen: Path, destino: Path) -> None:
 
 
 def importar_respaldo(origen: str) -> bool:
-    """Descarga, verifica y extrae un respaldo en la raíz local."""
+    """Descarga, verifica y extrae un respaldo en la raíz local.
+
+    Si `origen` está vacío se prueban solas, por este orden, las fuentes del
+    proyecto: el tarball versionado en git y la release rodante del mundo.
+    """
+    if not origen:
+        slug = _slug_repo()
+        candidatas = []
+        if slug:
+            candidatas.append(f"https://raw.githubusercontent.com/{slug}/main/"
+                              f"respaldo/{ASSET_MUNDO}")
+        candidatas.append(url_mundo())
+        for intento in [c for c in candidatas if c]:
+            log(f"Probando {intento}")
+            try:
+                return _importar_desde(intento)
+            except (RuntimeError, requests.RequestException) as e:
+                aviso(f"No se pudo ({type(e).__name__}).")
+        error("No se encontró el mundo ni en el repositorio ni en la release.")
+        return False
+    return _importar_desde(origen)
+
+
+def _importar_desde(origen: str) -> bool:
     _, ext = _compresor()
     RESPALDO_DIR.mkdir(parents=True, exist_ok=True)
     destino = RESPALDO_DIR / f"descargado{ext}"
@@ -2914,7 +3031,7 @@ def preguntar_crear_o_importar() -> str:
     print("  NO HAY NINGÚN SERVIDOR EN ESTA CARPETA")
     print("=" * 62)
     print("  1) Crear uno nuevo (descargar Paper y generar mundo)")
-    print("  2) Importar un respaldo (.tar.zst) desde un repositorio")
+    print("  2) Importar un respaldo (.tar.zst) de este repositorio o de la release")
     print("  3) Cancelar")
     print("=" * 62)
     if not sys.stdin.isatty():
@@ -2964,7 +3081,10 @@ def subir_cambios(mensaje: str, rama: str = "main", con_respaldo: bool = True,
 
     if con_respaldo:
         if not crear_respaldo(con_jar=con_jar, forzar=forzar_respaldo):
-            return False
+            # Antes esto abortaba todo el commit, y con el mundo grande no se
+            # podía ni subir un cambio de código. El código siempre sube.
+            aviso("El respaldo del mundo no se pudo hacer, pero los cambios de "
+                  "código se suben igualmente.")
 
     _git(["add", "-A"])
     # El respaldo se versiona a propósito: si el .gitignore lo tapara, se fuerza.

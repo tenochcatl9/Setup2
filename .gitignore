@@ -63,3 +63,7 @@ env/
 .idea/
 .DS_Store
 # <<< FIN bloque gestionado por setup_mc.py <<<
+
+# El mundo ya no cabe en git (>100 MB): vive en la release
+# world, con URL estable. Ver setup_mc.py.
+respaldo/servidor-mc.tar.zst
