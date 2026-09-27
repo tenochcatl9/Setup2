@@ -799,6 +799,9 @@ def _contenido_gitignore() -> str:
         # mientras quepa en git; si no cabe, se publica como release y esta
         # misma línea se añade aquí sola hasta que vuelva a caber.
         "respaldo/mundo-*.tar.zst",
+        # Carpeta de la versión anterior del script; se ignora por si queda
+        # alguna whilst no se haya reiniciado con el código nuevo.
+        "respaldo/auto/",
         "",
         "# Python",
         "__pycache__/",
@@ -2242,12 +2245,23 @@ def modo_notificacion(args) -> int:
     return codigo
 # ─── 13. Respaldo comprimido e importación ───────────────────────────────
 # Rutas que se empaquetan (relativas a SERVER_DIR); el resto se regenera al importar.
+# Lo que se versiona en git: plugins, configuración y datos de Paper. Entra en
+# ~20 MB, así que el repositorio lo aguanta siempre. El mundo, que ya no cabe,
+# va aparte a la release.
+BACKUP_INCLUYE_INSTALACION = ["plugins", "config", ".paper", "server.properties",
+                              "bukkit.yml", "spigot.yml", "eula.txt"]
 BACKUP_INCLUYE = ["server.jar", "world", "plugins", "config", ".paper",
                   "server.properties", "eula.txt", "ops.json", "whitelist.json",
                   "banned-players.json", "banned-ips.json", "usercache.json",
                   "bukkit.yml", "spigot.yml", "commands.yml"]
+# El respaldo del mundo va a una release PÚBLICA, así que fuera de aquí no
+# entran las cuentas: plugins/AuthMe/authme.db lleva usuario, hash de
+# contraseña e IP de cada jugador. Quien lo baje podría atacarlos por fuerza
+# bruta. Si prefieres conservarlo, haz el repositorio privado.
 BACKUP_EXCLUYE = [".env", ".env.*", ".git", "*.pid", "*.log", "*.part", "consola",
-                  "libraries", "cache", "respaldo", "__pycache__"]
+                  "libraries", "cache", "respaldo", "__pycache__",
+                  "plugins/AuthMe/*.db", "plugins/AuthMe/*.db-wal",
+                  "plugins/AuthMe/*.db-shm"]
 TAMANO_ADVERTENCIA = 50 * 1024 * 1024
 TAMANO_MAXIMO = 100 * 1024 * 1024
 # Techo del repositorio: cada copia del respaldo queda en el historial para
@@ -2737,6 +2751,41 @@ def _en_release(activo: bool) -> None:
     if not activo:
         _git(["add", "-f", rel])
 
+def crear_respaldo_instalacion() -> bool:
+    """Empaqueta plugins + configuración (~20 MB) en respaldo/instalacion.tar.zst.
+
+    Este sí se versiona en git: el mundo ya no cabe (160 MB) y se va a una
+    release, pero el resto de la instalación del servidor cabe de sobra y así
+    queda en el repositorio, que es lo que se puede ver y recuperar.
+    """
+    destino = RESPALDO_DIR / "instalacion.tar.zst"
+    incluir = [q for q in BACKUP_INCLUYE_INSTALACION
+               if (SERVER_DIR / q).exists()]
+    if not incluir:
+        return False
+    archivos, hash_contenido = _hash_contenido(SERVER_DIR, incluir)
+    manifiesto = {
+        "creado": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "paper": _version_paper() or "desconocida",
+        "minecraft": _version_mc_del_jar() or "desconocida",
+        "solo_instalacion": True,
+        "contenido_sha256": hash_contenido,
+        "archivos": archivos,
+    }
+    try:
+        _empaquetar(destino, manifiesto, incluir)
+    except RuntimeError as e:
+        error(str(e))
+        return False
+    if MANIFIESTO not in _miembros_de_respaldo(destino):
+        destino.unlink(missing_ok=True)
+        error("El respaldo de instalación no lleva manifiesto; se borra.")
+        return False
+    ok(f"Respaldo de instalación: {destino.stat().st_size / 1048576:,.0f} MB "
+       f"(plugins y configuración, se versiona en git)")
+    return True
+
+
 def _empaquetar(destino: Path, manifiesto: dict, incluir: list,
                 total_esperado: int | None = None) -> tuple:
     """Escribe el tar comprimido con el manifiesto dentro. Devuelve (bytes, segundos).
@@ -2890,6 +2939,7 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
         log("    import la baja automáticamente si el repositorio no lo trae.")
         RESPALDO_ACTUAL = None
         return True
+    crear_respaldo_instalacion()
     # Si antes vivía en la release y ya cabe, se vuelve a meter en git.
     _en_release(False)
     ok(f"Respaldo listo: {_relativo(RESPALDO_ACTUAL)} "

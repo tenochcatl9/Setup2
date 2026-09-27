@@ -50,6 +50,7 @@ consola
 !respaldo/
 !respaldo/**
 respaldo/mundo-*.tar.zst
+respaldo/auto/
 
 # Python
 __pycache__/
@@ -63,6 +64,7 @@ env/
 .idea/
 .DS_Store
 # <<< FIN bloque gestionado por setup_mc.py <<<
+
 
 
 
