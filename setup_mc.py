@@ -94,7 +94,7 @@ USER_AGENT = "CodeSpace-MC-Setup/1.0 (contact: tu@email.com)"
 PUERTO_MC = 25565
 PUERTO_TUNEL = 80
 MEMORIA_INICIAL = "1G"
-MEMORIA_MAXIMA = "2G"
+MEMORIA_MAXIMA = "8G"
 TIMEOUT_TUNEL = 60
 TIMEOUT_ARRANQUE = 240
 INTERVALO_AVISO_TUNEL = 10
@@ -2508,6 +2508,26 @@ def _purgar_backups_auto() -> None:
             pass
 
 
+_BACKUP_AVISADO = False          # ya se avisó del primer respaldo de esta corrida
+
+
+def _avisar_backup(mensaje: str) -> None:
+    """Notifica a Discord, pero como mucho una vez por corrida (y al fallar).
+
+    Avisar en cada copia sería un mensaje cada 20 minutos, día y noche; con
+    avisar al primer respaldo ya se confirma que funcionan, y si alguno falla
+    sí que hay que enterarse (antes los fallos pasaban inadvertidos).
+    """
+    global _BACKUP_AVISADO
+    if _BACKUP_AVISADO and "fall" not in mensaje.lower():
+        return
+    webhook = obtener_webhook()
+    if not webhook:
+        return
+    if enviar_a_discord(webhook, mensaje):
+        _BACKUP_AVISADO = True
+
+
 def respaldo_automatico(puerto: int = 25565) -> bool:
     """Empaqueta el mundo SIN parar el servidor.
 
@@ -2565,9 +2585,16 @@ def respaldo_automatico(puerto: int = 25565) -> bool:
         ok(f"Respaldo automático: respaldo/auto/{destino.name} "
            f"({destino.stat().st_size / 1048576:,.0f} MB)")
         _purgar_backups_auto()
+        _avisar_backup(
+            "**Respaldo automático hecho**\n"
+            f"`respaldo/auto/{destino.name}` — "
+            f"{destino.stat().st_size / 1048576:,.0f} MB\n"
+            f"Se sigue haciendo uno cada {BACKUP_AUTO_MINUTOS} min sin parar el "
+            f"servidor (se guardan los {BACKUP_AUTO_MANTENER} últimos).")
         return True
     except (OSError, RuntimeError) as e:
         error(f"No se pudo hacer el respaldo automático: {e}")
+        _avisar_backup(f"**Falló el respaldo automático**\n{e}")
         return False
     finally:
         if watchdog is not None:
