@@ -6,6 +6,7 @@
 
 const $ = (id) => document.getElementById(id);
 
+
 // ── utilidades ────────────────────────────────────────────────────────────
 function escapar(texto) {
   return String(texto).replace(/[&<>"']/g, (c) => (

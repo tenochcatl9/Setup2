@@ -1,7 +1,9 @@
 """Cliente del panel (Cloudflare Worker): auto-actualización, latidos y publicación.
 
 Todo es opcional: sin PANEL_URL en el .env, todas las funciones son no-ops y
-el script funciona exactamente igual que antes.
+el script funciona exactamente igual que antes. La página estática (Cloudflare
+Pages) vive en pagina.py y comparte con este módulo el núcleo de la interfaz
+(_aplicar_ui) y la aplicación de versiones (actualizar).
 """
 
 import base64
@@ -250,29 +252,42 @@ def _resguardar_version_actual(version: str) -> Path:
     return destino
 
 
-def actualizar(forzar: bool = False, reiniciar: bool = True) -> bool:
-    """Aplica la versión del panel si es más nueva que la local.
+def _url_absoluta(url: str, origen: str = "") -> str:
+    """Resuelve una url relativa de un manifest contra su origen ('' si no puede)."""
+    if not url or "://" in url:
+        return url
+    if not origen:
+        return ""
+    return f"{origen.rstrip('/')}/{url.lstrip('/')}"
+
+
+def actualizar(forzar: bool = False, reiniciar: bool = True,
+               manifest: dict | None = None, origen: str = "",
+               fuente: str = "Panel") -> bool:
+    """Aplica la versión publicada si es más nueva que la local.
 
     - Verifica sha256 del paquete y que compile antes de tocar nada.
     - Respalda la versión actual fuera del repo antes de reemplazarla.
     - Con `reiniciar` relanza el script con el código nuevo (os.execv).
+    - `manifest`/`origen`/`fuente` permiten usar otra fuente (la página
+      estática): la url relativa del manifest se resuelve contra `origen`.
     """
-    manifest = obtener_manifest()
+    manifest = manifest or obtener_manifest()
     if not manifest:
-        log("Panel: no hay ninguna versión publicada (o no responde).")
+        log(f"{fuente}: no hay ninguna versión publicada (o no responde).")
         return False
     remota = str(manifest.get("version") or "")
     sha = str(manifest.get("sha256") or "")
-    url = str(manifest.get("url") or "")
+    url = _url_absoluta(str(manifest.get("url") or ""), origen)
     if not (remota and sha and url):
-        aviso("Panel: manifest incompleto (faltan version/sha256/url).")
+        aviso(f"{fuente}: manifest incompleto (faltan version/sha256/url).")
         return False
     local = config.VERSION_SCRIPT
     if not forzar and _tupla_version(remota) <= _tupla_version(local):
-        log(f"Panel: el script está al día (local v{local}, panel v{remota}).")
+        log(f"{fuente}: el script está al día (local v{local}, {fuente.lower()} v{remota}).")
         return False
     changelog = str(manifest.get("changelog") or "").strip()
-    log(f"Panel: hay versión nueva v{remota} (local v{local}).")
+    log(f"{fuente}: hay versión nueva v{remota} (local v{local}).")
     if changelog:
         print("    " + changelog.replace("\n", "\n    ")[:600])
 
@@ -421,22 +436,22 @@ def publicar_ui(version: str = "") -> bool:
     return True
 
 
-def actualizar_ui(base: Path | None = None) -> int:
-    """Baja la interfaz del panel si cambió (sha256). Nº de archivos actualizados.
-
-    Nunca aborta nada: sin panel, sin red o con respuestas raras se sigue con
-    los archivos locales. Antes de reemplazar algo se resguarda fuera del repo.
-    """
-    base = base or BASE_DIR
-    url, _ = config_panel()
-    if not url:
-        return 0
+def _descargar_ui(url: str, logica: str):
+    """Bytes de un archivo de interfaz del panel, o None si falla."""
     try:
-        r = requests.get(f"{url}/api/ui", headers=_cabeceras(), timeout=8)
+        r = requests.get(f"{url}/api/ui/{logica}", headers=_cabeceras(), timeout=30)
         r.raise_for_status()
-        indice = r.json()
-    except (requests.RequestException, ValueError):
-        return 0
+        return r.content
+    except requests.RequestException:
+        return None
+
+
+def _aplicar_ui(indice, obtener, base: Path) -> int:
+    """Aplica un índice de interfaz (rutas + sha256) bajando con obtener().
+
+    Es el núcleo compartido por el panel (API) y la página (estática): compara
+    sha256, resguarda lo que va a reemplazar y nunca aborta nada.
+    """
     if not isinstance(indice, dict):
         return 0
     actualizados = 0
@@ -456,14 +471,11 @@ def actualizar_ui(base: Path | None = None) -> int:
             continue
         if destino.is_file() and _sha256(destino) == sha:
             continue
-        try:
-            descarga = requests.get(f"{url}/api/ui/{logica}", headers=_cabeceras(), timeout=30)
-            descarga.raise_for_status()
-        except requests.RequestException:
+        contenido = obtener(logica)
+        if contenido is None:
             continue
-        contenido = descarga.content
         if hashlib.sha256(contenido).hexdigest() != sha:
-            aviso(f"Panel: {logica} no coincide con su sha256; se conserva el local.")
+            aviso(f"Interfaz: {logica} no coincide con su sha256; se conserva el local.")
             continue
         if destino.is_file():
             copia = respaldo / logica
@@ -476,10 +488,30 @@ def actualizar_ui(base: Path | None = None) -> int:
             destino.parent.mkdir(parents=True, exist_ok=True)
             destino.write_bytes(contenido)
         except OSError as exc:
-            aviso(f"Panel: no se pudo escribir {logica}: {exc}")
+            aviso(f"Interfaz: no se pudo escribir {logica}: {exc}")
             continue
         actualizados += 1
-        log(f"Panel: interfaz actualizada ({logica}).")
+        log(f"Interfaz: actualizada ({logica}).")
+    return actualizados
+
+
+def actualizar_ui(base: Path | None = None) -> int:
+    """Baja del panel la interfaz si cambió (sha256). Nº de archivos actualizados.
+
+    Nunca aborta nada: sin panel, sin red o con respuestas raras se sigue con
+    los archivos locales. Antes de reemplazar algo se resguarda fuera del repo.
+    """
+    base = base or BASE_DIR
+    url, _ = config_panel()
+    if not url:
+        return 0
+    try:
+        r = requests.get(f"{url}/api/ui", headers=_cabeceras(), timeout=8)
+        r.raise_for_status()
+        indice = r.json()
+    except (requests.RequestException, ValueError):
+        return 0
+    actualizados = _aplicar_ui(indice, lambda logica: _descargar_ui(url, logica), base)
     if actualizados:
         ok(f"Panel: {actualizados} archivo/s de la interfaz al día.")
     return actualizados
@@ -506,36 +538,47 @@ def _anotar_version_local(version: str) -> None:
 
 
 def publicar(mensaje: str, version: str = "") -> bool:
-    """Empaqueta el script local y lo sube al panel (--publicar)."""
+    """Publica esta versión (--publicar): panel y/o página, según el .env."""
+    from . import pagina                     # tardío: evita un ciclo de imports
     url, clave = config_panel()
-    if not url or not clave:
-        error("Faltan PANEL_URL y/o PANEL_API_KEY en el .env: no se puede publicar.")
+    hay_panel = bool(url and clave)
+    _pagina_url, proyecto = pagina.pagina_config()
+    hay_pagina = bool(proyecto)
+    if not hay_panel and not hay_pagina:
+        error("No hay dónde publicar: define PANEL_URL/PANEL_API_KEY y/o "
+              "PAGES_PROYECTO en el .env.")
         return False
     version = version or time.strftime("%Y.%m.%d.%H%M", time.gmtime())
     # La versión se escribe ANTES de empaquetar: así el paquete publicado ya
     # trae este número y quien se actualice no vuelve a verlo como "nuevo".
     _anotar_version_local(version)
-    paquete = _empaquetar_script()
-    sha = hashlib.sha256(paquete).hexdigest()
-    cuerpo = {
-        "version": version,
-        "sha256": sha,
-        "changelog": mensaje,
-        "paquete_b64": base64.b64encode(paquete).decode(),
-    }
-    log(f"Publicando v{version} ({len(paquete):,} bytes) en {url}...")
-    try:
-        r = requests.post(f"{url}/api/publicar", json=cuerpo,
-                          headers=_cabeceras(), timeout=120)
-    except requests.RequestException as exc:
-        error(f"No se pudo contactar con el panel: {exc}")
-        return False
-    if r.status_code == 401:
-        error("El panel rechazó la clave (PANEL_API_KEY).")
-        return False
-    if not r.ok:
-        error(f"El panel devolvió un error: {r.status_code} {r.text[:300]}")
-        return False
-    ok(f"Versión v{version} publicada. Las demás máquinas se actualizarán al arrancar.")
-    publicar_ui(version)   # la interfaz (webui/ + templates/) viaja con el script
+    if hay_panel:
+        paquete = _empaquetar_script()
+        sha = hashlib.sha256(paquete).hexdigest()
+        cuerpo = {
+            "version": version,
+            "sha256": sha,
+            "changelog": mensaje,
+            "paquete_b64": base64.b64encode(paquete).decode(),
+        }
+        log(f"Publicando v{version} ({len(paquete):,} bytes) en {url}...")
+        try:
+            r = requests.post(f"{url}/api/publicar", json=cuerpo,
+                              headers=_cabeceras(), timeout=120)
+        except requests.RequestException as exc:
+            error(f"No se pudo contactar con el panel: {exc}")
+            return False
+        if r.status_code == 401:
+            error("El panel rechazó la clave (PANEL_API_KEY).")
+            return False
+        if not r.ok:
+            error(f"El panel devolvió un error: {r.status_code} {r.text[:300]}")
+            return False
+        ok(f"Versión v{version} publicada en el panel. "
+           "Las demás máquinas se actualizarán al arrancar.")
+        publicar_ui(version)   # la interfaz (webui/ + templates/) viaja con el script
+    else:
+        aviso("Panel no configurado: la publicación va solo a la página.")
+    if hay_pagina:
+        pagina.publicar_pagina(version, mensaje)
     return True

@@ -41,7 +41,7 @@ USER_AGENT = "CodeSpace-MC-Setup/1.0 (contact: tu@email.com)"
 
 # Versión del script. --publicar la actualiza sola; el panel la compara al
 # arrancar para decidir si hay que auto-actualizarse (formato AAAA.MM.DD.HHMM).
-VERSION_SCRIPT = "2026.10.17.2241"
+VERSION_SCRIPT = "2026.10.17.2345"
 
 PUERTO_MC = 25565
 

@@ -1,0 +1,167 @@
+/* ==========================================================================
+   TenoHost — página de presentación de setup2
+   rojo y negro · Times New Roman · esquinas rectas (nada de border-radius)
+   ========================================================================== */
+
+:root {
+  --fondo: #070202;
+  --fondo-caja: #030000;
+  --panel: #100404;
+  --panel-alto: #170606;
+  --rojo: #a80f0f;
+  --rojo-vivo: #ff2626;
+  --rojo-oscuro: #4a0d0d;
+  --borde: #3a0c0c;
+  --texto: #eadcdc;
+  --texto-tenue: #9c7272;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border-radius: 0 !important;
+}
+
+html, body { height: 100%; }
+
+body {
+  background: var(--fondo);
+  color: var(--texto);
+  font-family: "Times New Roman", Times, "Liberation Serif", Georgia, serif;
+  font-size: 17.5px;
+  line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+/* ─── Cabecera ─────────────────────────────────────────────────────────── */
+.cabecera {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px 22px;
+  flex-wrap: wrap;
+  padding: 14px 22px;
+  background: var(--panel);
+  border-bottom: 2px solid var(--rojo);
+}
+
+.marca { font-size: 30px; letter-spacing: 2px; }
+.marca span { color: var(--rojo-vivo); }
+.tagline { color: var(--texto-tenue); font-style: italic; }
+
+/* ─── Cuerpo ───────────────────────────────────────────────────────────── */
+main {
+  width: min(920px, 100% - 36px);
+  margin: 26px auto 40px;
+}
+
+.bloque {
+  background: var(--panel);
+  border: 1px solid var(--borde);
+  padding: 20px 22px;
+  margin-bottom: 20px;
+}
+
+h1 { font-size: 31px; line-height: 1.2; margin-bottom: 12px; }
+
+h2 {
+  font-size: 20px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--rojo-vivo);
+  border-bottom: 1px solid var(--rojo-oscuro);
+  padding-bottom: 6px;
+  margin-bottom: 14px;
+}
+
+p + p, p + ul, p + pre, ul + p, pre + p { margin-top: 10px; }
+
+.puntos { padding-left: 20px; }
+.puntos li { margin-bottom: 4px; }
+.puntos b { color: var(--rojo-vivo); }
+
+.pasos { padding-left: 22px; }
+.pasos li { margin-bottom: 16px; }
+.titulo { display: block; font-size: 19px; margin-bottom: 2px; }
+
+.nota { color: var(--texto-tenue); }
+.nota code { color: var(--texto-tenue); }
+
+a { color: var(--rojo-vivo); }
+
+/* ─── Comandos ─────────────────────────────────────────────────────────── */
+pre, code {
+  font-family: "Courier New", Courier, monospace;
+  font-size: 14.5px;
+}
+
+code { color: var(--rojo-vivo); }
+
+pre {
+  background: var(--fondo-caja);
+  border: 1px solid var(--borde);
+  border-left: 3px solid var(--rojo);
+  padding: 10px 12px;
+  margin: 8px 0;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #f3d6d6;
+  cursor: pointer;
+}
+
+pre:hover { border-color: var(--rojo-vivo); border-left-color: var(--rojo-vivo); }
+pre code { color: inherit; }
+
+/* ─── Descargas ────────────────────────────────────────────────────────── */
+.descarga {
+  display: flex;
+  align-items: center;
+  gap: 8px 18px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.boton {
+  display: inline-block;
+  padding: 11px 20px;
+  text-decoration: none;
+  background: var(--rojo);
+  border: 1px solid var(--rojo-vivo);
+  color: #fff;
+  font-size: 19px;
+  letter-spacing: 1px;
+}
+
+.boton:hover { background: var(--rojo-vivo); }
+
+.datos { color: var(--texto-tenue); }
+
+.detalles summary { cursor: pointer; color: var(--texto-tenue); }
+.detalles summary:hover { color: var(--texto); }
+
+.sha {
+  margin-top: 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  cursor: text;
+}
+
+/* ─── Pie ──────────────────────────────────────────────────────────────── */
+.pie {
+  margin-top: auto;
+  padding: 14px 22px;
+  background: var(--panel);
+  border-top: 2px solid var(--rojo);
+  color: var(--texto-tenue);
+  font-size: 15px;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px 18px;
+  flex-wrap: wrap;
+}
+
+.pie b { color: var(--rojo-vivo); }

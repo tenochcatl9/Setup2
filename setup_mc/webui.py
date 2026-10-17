@@ -23,6 +23,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import config
+from . import pagina
 from .avisos import enviar_a_discord, obtener_webhook
 from .config import (BASE_DIR, FIFO_CONSOLA, LOG_SERVIDOR, LOG_TUNEL, LOGS_DIR,
                      PID_SERVIDOR, PID_TUNEL, PUERTO_MC)
@@ -404,12 +405,16 @@ def lanzar_desacoplado(puerto_preferido: int = PUERTO_UI_POR_DEFECTO):
         time.sleep(0.15)
     return puerto                           # puede tardar algo más ya arrancando
 
-def _refresco_desde_panel() -> None:
-    """Baja interfaz nueva del panel, si la hay (best-effort, sin ruido)."""
+def _refresco_silencioso() -> None:
+    """Baja interfaz nueva del panel o de la página, si la hay (sin ruido)."""
     try:
         if config_panel()[0]:
             actualizar_ui()
     except Exception:  # nunca puede tumbar la UI por el panel
+        pass
+    try:
+        pagina.actualizar_ui_pagina()
+    except Exception:  # ni por la página
         pass
 
 def servir_foreground(puerto_preferido: int = PUERTO_UI_POR_DEFECTO) -> int:
@@ -419,9 +424,13 @@ def servir_foreground(puerto_preferido: int = PUERTO_UI_POR_DEFECTO) -> int:
         error(f"No hay ningún puerto libre cerca de {puerto_preferido} para la UI.")
         return 1
     servidor = _crear_servidor(puerto)
-    # La interfaz se mantiene al día con el panel en segundo plano: si hay
-    # html/js/css nuevos publicados, se sirven sin reiniciar nada.
-    threading.Thread(target=_refresco_desde_panel, daemon=True).start()
+    # Si aún no hay interfaz local (primera vez: solo se bajó el script), se
+    # trae de la página antes de servir; si no, se refresca en segundo plano.
+    if not (BASE_DIR / "webui" / "index.html").is_file():
+        log("Interfaz no encontrada: bajándola de la página...")
+        _refresco_silencioso()
+    else:
+        threading.Thread(target=_refresco_silencioso, daemon=True).start()
     print()
     print("=" * 62)
     print("  UI LOCAL (página de control del servidor)")

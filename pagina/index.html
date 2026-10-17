@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TenoHost — servidor de Minecraft Paper en un comando</title>
+<meta name="description" content="setup2 despliega un servidor Minecraft Paper con plugins, túnel público y respaldos en Git. Guía de uso y descarga.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+
+<header class="cabecera">
+  <div class="marca">Teno<span>Host</span></div>
+  <div class="tagline">servidor de Minecraft · todo en un comando</div>
+</header>
+
+<main>
+
+<section class="bloque">
+  <h1>Tu servidor de Minecraft, listo para jugar</h1>
+  <p><strong>setup2</strong> monta un servidor <strong>Paper</strong> completo en cualquier máquina Linux o Codespace: descarga el servidor y los plugins, abre un <strong>túnel público</strong>, guarda respaldos del mundo y sube los cambios a Git — todo desde la terminal.</p>
+  <ul class="puntos">
+    <li><b>Paper al día</b>: descarga la última versión estable y la mantiene actualizada.</li>
+    <li><b>Plugins sin dolores</b>: entra cualquier versión de cliente (ViaVersion, ViaBackwards), registro con AuthMe y skins con SkinsRestorer.</li>
+    <li><b>Túnel público</b>: una dirección para que entren tus amigos, con túnel de respaldo si el principal falla.</li>
+    <li><b>Respaldos</b>: el mundo se empaqueta solo y los cambios se suben a Git.</li>
+    <li><b>Página de control</b>: estado, consola y acciones desde el navegador, en localhost.</li>
+  </ul>
+</section>
+
+<section class="bloque">
+  <h2>Cómo usarlo</h2>
+  <ol class="pasos">
+    <li>
+      <span class="titulo">1. Descarga el script</span>
+      <pre><code>curl -fsSLO https://tenohost.pages.dev/script/setup_mc.tar.gz
+mkdir mi-servidor &amp;&amp; tar xzf setup_mc.tar.gz -C mi-servidor &amp;&amp; cd mi-servidor</code></pre>
+    </li>
+    <li>
+      <span class="titulo">2. Arranca</span>
+      <pre><code>python3 setup_mc.py</code></pre>
+      <p class="nota">La primera vez el script baja de esta misma página la interfaz y los temas, y comprueba que tienes Python 3 y Java 21+.</p>
+    </li>
+    <li>
+      <span class="titulo">3. Juega</span>
+      <p>Al terminar verás la dirección pública del túnel para compartirla. La página de control queda en <code>http://127.0.0.1:8080</code> (en un Codespace, ábrela desde la pestaña <b>PORTS</b>).</p>
+    </li>
+  </ol>
+  <p class="nota">¿Quieres avisos en Discord? Copia <code>.env.example</code> a <code>.env</code> y pega tu webhook en <code>DISCORD_WEBHOOK</code>.</p>
+</section>
+
+<section class="bloque" id="descargas">
+  <h2>Descargas</h2>
+  <div class="descarga">
+    <a class="boton" href="script/setup_mc.tar.gz" download>Descargar setup2 (tar.gz)</a>
+    <span class="datos" id="datos-version">comprobando versión…</span>
+  </div>
+  <details class="detalles">
+    <summary>Comprobación de integridad (sha256)</summary>
+    <pre id="sha256" class="sha">—</pre>
+  </details>
+</section>
+
+</main>
+
+<footer class="pie">
+  <span><b>TenoHost</b> · tenohost.pages.dev</span>
+  <span>la interfaz y los temas se actualizan solos desde esta página</span>
+</footer>
+
+<script src="guia.js"></script>
+</body>
+</html>

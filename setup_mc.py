@@ -26,7 +26,7 @@ Modos:
   python3 setup_mc.py --probar-webhook comprueba el webhook de Discord y sale
   python3 setup_mc.py --importar owner/repo
                                        restaura el mundo desde un .tar.zst
-  python3 setup_mc.py --publicar "msg" publica esta versión del script en el panel
+  python3 setup_mc.py --publicar "msg" publica esta versión (panel y/o página)
   python3 setup_mc.py --actualizar     aplica la última versión publicada y sale
   python3 setup_mc.py --ui             solo la página local de control (localhost)
 
@@ -43,6 +43,12 @@ consulta de la API la lista de plugins y reporta estado en vivo cada 5 min.
 raíz del panel muestra esa misma interfaz en modo público y el script la
 baja al arrancar (sha256 por archivo) para su versión de localhost.
 
+Página pública (Cloudflare Pages, https://tenohost.pages.dev por defecto):
+guía de uso y descarga del script (pagina/ + script/ + ui/). De aquí baja el
+script la interfaz (html/js/css) al arrancar, y también las versiones nuevas
+de sí mismo. Se controla con PAGINA_URL (o PAGINA_URL=no) y PAGES_PROYECTO
+en .env; --publicar la construye y la despliega con wrangler.
+
 Antes de subir cambios a la rama principal se comprime el servidor en
 respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con
 sha256). Ese archivo SÍ se versiona a propósito: es lo que permite importar
@@ -56,6 +62,7 @@ responde, el script cae automáticamente a Pinggy (solo ssh, sin cuenta).
 import argparse, signal, sys
 from setup_mc import config
 from setup_mc import mcserver
+from setup_mc import pagina
 from setup_mc import panel
 from setup_mc import tuneles
 from setup_mc import webui
@@ -129,11 +136,11 @@ def parse_args():
                    help="Importa un respaldo (owner/repo, URL de GitHub o URL directa)")
     p.add_argument("--reinstalar-plugins", action="store_true", help="Volver a descargar los plugins")
     p.add_argument("--sin-actualizar", action="store_true",
-                   help="No buscar versiones nuevas del script en el panel")
+                   help="No buscar versiones nuevas (panel o página) al arrancar")
     p.add_argument("--actualizar", action="store_true",
-                   help="Busca y aplica la última versión del panel, y sale")
+                   help="Busca y aplica la última versión publicada (panel o página), y sale")
     p.add_argument("--publicar", metavar="MENSAJE", default=None,
-                   help="Publica esta versión del script en el panel y sale")
+                   help="Publica esta versión: la sube al panel y/o despliega la página, y sale")
     p.add_argument("--ui", action="store_true",
                    help="Solo la página local de control (localhost), sin tocar el servidor")
     p.add_argument("--puerto-ui", type=int, default=8080,
@@ -201,20 +208,29 @@ def main():
     except (ValueError, OSError):
         pass
 
-    # 0. Panel: publicar, actualizar o comprobar versión nueva antes de nada
+    # 0. Panel y página: publicar, actualizar o comprobar versión antes de nada
     if args.publicar is not None:
         return 0 if panel.publicar(args.publicar) else 1
     if args.actualizar:
-        panel.actualizar_al_arrancar(manual=True)
+        if panel.hay_panel():
+            panel.actualizar_al_arrancar(manual=True)
+        if pagina.pagina_config()[0]:
+            pagina.actualizar_al_arrancar(manual=True)
+        if not panel.hay_panel() and not pagina.pagina_config()[0]:
+            error("Ni panel ni página configurados: revisa PANEL_URL y "
+                  "PAGINA_URL en el .env.")
         return 0
     if not args.sin_actualizar:
         panel.actualizar_al_arrancar()
+        pagina.actualizar_al_arrancar()
 
     titulo("SETUP SERVIDOR MINECRAFT PAPER + TÚNEL PÚBLICO")
     log(f"Directorio del servidor (raíz local): {SERVER_DIR}")
     log(f"JAR del servidor: {SERVER_JAR}")
     if panel.hay_panel():
         log(f"Panel: {panel.config_panel()[0]}  (script v{config.VERSION_SCRIPT})")
+    if pagina.pagina_config()[0]:
+        log(f"Página: {pagina.pagina_config()[0]}  (script v{config.VERSION_SCRIPT})")
 
     # 0a. Requisitos y secretos: si .env no está oculto, se cancela aquí
     version_java = comprobar_java()

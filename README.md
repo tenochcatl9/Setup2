@@ -1,4 +1,4 @@
-# Setup2 — servidor de Minecraft en Codespaces, con túnel y panel
+# Setup2 — servidor de Minecraft en Codespaces, con túnel, panel y página pública
 
 Un comando despliega un servidor Paper listo para jugar: descarga el jar, instala
 los plugins, abre un túnel público, avisa por Discord, respalda el mundo y sube
@@ -6,12 +6,13 @@ los cambios a Git. El propio script levanta una **página local de control**
 (estado, consola y acciones en el navegador); un panel opcional en Cloudflare
 (carpeta `panel/`) permite auto-actualizar el script, cambiar la lista de
 plugins, ver el estado en vivo y publicar esa misma interfaz como página
-pública del servidor.
+pública del servidor, y una **página de presentación** en Cloudflare Pages
+(carpeta `pagina/`) hace de guía, descarga y fuente de actualizaciones.
 
 ## Uso rápido
 
 ```bash
-cp .env.example .env     # rellena DISCORD_WEBHOOK y, si quieres panel, PANEL_URL/PANEL_API_KEY
+cp .env.example .env     # rellena DISCORD_WEBHOOK y lo que uses (panel, página)
 python3 setup_mc.py
 ```
 
@@ -28,6 +29,8 @@ python3 setup_mc.py
   mientras el servidor corre.
 - **Panel (opcional)**: auto-actualización del propio script, estado en vivo y
   publicación de versiones.
+- **Página pública (opcional)**: guía y descarga del script en Cloudflare
+  Pages; de ahí baja también la interfaz y las versiones nuevas.
 
 ## Flags principales
 
@@ -38,9 +41,9 @@ python3 setup_mc.py
 | `--ui` | Solo la página local de control (localhost), sin tocar el servidor |
 | `--puerto-ui N` | Puerto de la UI local (8080) |
 | `--sin-ui` | No arrancar la UI local |
-| `--publicar "mensaje"` | Publica esta versión del script en el panel |
-| `--actualizar` | Aplica la última versión publicada en el panel y sale |
-| `--sin-actualizar` | No busca versiones nuevas al arrancar |
+| `--publicar "mensaje"` | Publica esta versión: la sube al panel y/o despliega la página |
+| `--actualizar` | Aplica la última versión publicada (panel o página) y sale |
+| `--sin-actualizar` | No busca versiones nuevas (panel o página) al arrancar |
 | `--reinstalar-plugins` | Vuelve a descargar los plugins |
 | `--importar URL` | Restaura un mundo desde un respaldo (`owner/repo`, URL de GitHub o directa) |
 | `--probar-webhook` | Manda un mensaje de prueba a Discord y sale |
@@ -70,12 +73,34 @@ sobrevive a la salida del script; se apaga con su botón «apagar la ui». Solo
 escucha en `127.0.0.1` (nunca se expone sola a internet) y no requiere clave.
 El HTML y el JS están en `webui/` (archivos reales, sin nada embebido).
 
-Esos mismos archivos viajan por el panel: `--publicar` sube `webui/` +
-`templates/` y el script los vuelve a bajar al arrancar si cambiaron (sha256
-por archivo, respaldo fuera del repo y desactivables con `--sin-actualizar`).
-Así la interfaz evoluciona sin tocar el script; además, la raíz del panel
-muestra esa misma página en **modo público** (estado, IP y versiones, sin
-consola ni acciones: eso solo existe en localhost).
+Esos mismos archivos viajan por el panel y por la página pública:
+`--publicar` sube `webui/` + `templates/`, y el script los vuelve a bajar al
+arrancar si cambiaron (sha256 por archivo, respaldo fuera del repo y
+desactivables con `--sin-actualizar`). Así la interfaz evoluciona sin tocar el
+script; además, la raíz del panel muestra esa misma página en **modo público**
+(estado, IP y versiones, sin consola ni acciones: eso solo existe en localhost).
+
+## Página pública (opcional)
+
+En `pagina/` vive la página de presentación (guía de uso y descarga del
+script, nada del panel) que se publica en Cloudflare Pages, por defecto
+`https://tenohost.pages.dev`. Junto a ella se publican dos bloques:
+
+- `script/` — el script en `setup_mc.tar.gz` y un `manifest.json` con versión,
+  sha256 y changelog. Es la descarga que ofrece la página.
+- `ui/` — la interfaz local (`index.html`, `app.js`, `templates/*.css`) y un
+  `indice.json` con rutas y sha256.
+
+Con `PAGINA_URL` en `.env` (por defecto la de arriba; `PAGINA_URL=no` la
+desactiva) el script baja de ahí la interfaz al arrancar y también las
+versiones nuevas de sí mismo, sin necesidad de panel. El paquete de descarga
+solo trae los `.py`: la interfaz y los temas llegan solos en el primer
+arranque.
+
+Para desplegarla: define `PAGES_PROYECTO` en `.env` (nombre del proyecto en
+Pages) y ejecuta `python3 setup_mc.py --publicar "qué cambió"` en una máquina
+con `npx wrangler` autenticado (`npx wrangler login`). El primer despliegue
+crea el proyecto.
 
 ## Panel (opcional)
 
@@ -129,10 +154,12 @@ a la API. El despliegue del Worker está paso a paso en `panel/README.md`.
 | `estado` | Modo desacoplado (`--solo-notificar`) |
 | `respaldo` | Respaldos del mundo, `subir_cambios` |
 | `panel` | Cliente del panel: auto-update (script e interfaz), latidos, plugins, `--publicar` |
+| `pagina` | Página pública (Pages): construir/desplegar y bajadas estáticas (interfaz y script) |
 | `webui` | Página local de control: API, consola por FIFO, acciones, temas |
 
-Fuera del paquete: `webui/` (HTML/JS de la página local) y `templates/`
-(temas CSS; `template_default` es el de por defecto).
+Fuera del paquete: `webui/` (HTML/JS de la página local), `templates/`
+(temas CSS; `template_default` es el de por defecto) y `pagina/` (la landing
+que se publica en Pages).
 
 ## Seguridad
 
