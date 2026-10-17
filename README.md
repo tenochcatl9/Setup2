@@ -5,7 +5,8 @@ los plugins, abre un túnel público, avisa por Discord, respalda el mundo y sub
 los cambios a Git. El propio script levanta una **página local de control**
 (estado, consola y acciones en el navegador); un panel opcional en Cloudflare
 (carpeta `panel/`) permite auto-actualizar el script, cambiar la lista de
-plugins y ver el estado en vivo.
+plugins, ver el estado en vivo y publicar esa misma interfaz como página
+pública del servidor.
 
 ## Uso rápido
 
@@ -69,24 +70,40 @@ sobrevive a la salida del script; se apaga con su botón «apagar la ui». Solo
 escucha en `127.0.0.1` (nunca se expone sola a internet) y no requiere clave.
 El HTML y el JS están en `webui/` (archivos reales, sin nada embebido).
 
+Esos mismos archivos viajan por el panel: `--publicar` sube `webui/` +
+`templates/` y el script los vuelve a bajar al arrancar si cambiaron (sha256
+por archivo, respaldo fuera del repo y desactivables con `--sin-actualizar`).
+Así la interfaz evoluciona sin tocar el script; además, la raíz del panel
+muestra esa misma página en **modo público** (estado, IP y versiones, sin
+consola ni acciones: eso solo existe en localhost).
+
 ## Panel (opcional)
 
 En `panel/` vive un Worker de Cloudflare que sirve:
 
+- `GET /` — la misma interfaz de la página local en **modo público** (estado
+  en vivo, dirección del túnel, versiones y plugins; sin consola ni acciones).
+  Si todavía no hay interfaz publicada, muestra el dashboard.
+- `GET /panel` — dashboard de administración (estado, changelog y descarga).
+- `GET /app.js` y `GET /tema/<x>.css` — archivos de la interfaz publicada.
+- `GET /api/estado` — estado en el formato de la UI (público, para la página).
+- `GET /api/temas` — temas publicados.
 - `GET /api/manifest` — última versión publicada del script (versión, sha256,
   changelog, url del paquete). Es lo que consulta el script al arrancar.
 - `GET /api/plugins` — registro de plugins que instala el script.
+- `GET /api/ui` y `GET /api/ui/<ruta>` — índice (rutas + sha256) y archivos de
+  la interfaz publicada.
 - `GET /api/status` — estado del servidor (protegido con clave).
-- `POST /api/publicar`, `POST /api/heartbeat`, `POST /api/plugins` — escritura
-  con `Authorization: Bearer <PANEL_API_KEY>`.
-- `GET /` — dashboard con estado en vivo, changelog y descarga.
+- `POST /api/publicar`, `POST /api/ui`, `POST /api/heartbeat`, `POST /api/plugins`
+  — escritura con `Authorization: Bearer <PANEL_API_KEY>`.
 
 Con `PANEL_URL` y `PANEL_API_KEY` en `.env`:
 
 - Al arrancar, si hay versión nueva se descarga y aplica sola (sha256
   verificado, comprobación de que compila y respaldo fuera del repo). Desactívalo
   con `--sin-actualizar`.
-- Publica tu versión con `python3 setup_mc.py --publicar "qué cambió"`.
+- Publica tu versión con `python3 setup_mc.py --publicar "qué cambió"`: sube
+  el script y también la interfaz (`webui/` + `templates/`).
 - Mientras el servidor vive, un proceso ligero manda un latido cada 5 minutos y
   avisa del apagado (funciona también con `--solo-notificar`).
 
@@ -111,7 +128,7 @@ a la API. El despliegue del Worker está paso a paso en `panel/README.md`.
 | `tuneles` | Asyx y Pinggy, notificador de progreso |
 | `estado` | Modo desacoplado (`--solo-notificar`) |
 | `respaldo` | Respaldos del mundo, `subir_cambios` |
-| `panel` | Cliente del panel: auto-update, latidos, plugins, `--publicar` |
+| `panel` | Cliente del panel: auto-update (script e interfaz), latidos, plugins, `--publicar` |
 | `webui` | Página local de control: API, consola por FIFO, acciones, temas |
 
 Fuera del paquete: `webui/` (HTML/JS de la página local) y `templates/`

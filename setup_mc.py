@@ -39,6 +39,9 @@ temas (CSS) en templates/ (p. ej. templates/template_default.css).
 Panel (opcional, ver panel/README.md): con PANEL_URL y PANEL_API_KEY en .env
 el script se auto-actualiza al arrancar (--sin-actualizar lo desactiva),
 consulta de la API la lista de plugins y reporta estado en vivo cada 5 min.
+--publicar sube el script y también la interfaz (webui/ + templates/): la
+raíz del panel muestra esa misma interfaz en modo público y el script la
+baja al arrancar (sha256 por archivo) para su versión de localhost.
 
 Antes de subir cambios a la rama principal se comprime el servidor en
 respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con

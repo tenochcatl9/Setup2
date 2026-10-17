@@ -2,9 +2,16 @@
  * Panel + API del servidor de Minecraft (Cloudflare Workers).
  *
  * Rutas públicas (GET):
- *   /                 → dashboard HTML
+ *   /                 → página pública (la interfaz publicada) o el dashboard
+ *   /panel            → dashboard de administración (siempre disponible)
+ *   /app.js           → JS de la interfaz publicada
+ *   /tema/<x>.css     → tema (CSS) de la interfaz publicada
  *   /api/manifest     → última versión del script (versión, sha256, changelog, url)
  *   /api/plugins      → registro de plugins que el script instala
+ *   /api/estado       → estado público (mismo formato que el de localhost)
+ *   /api/temas        → temas disponibles en la interfaz publicada
+ *   /api/ui           → índice de la interfaz publicada (rutas + sha256)
+ *   /api/ui/<ruta>    → un archivo de la interfaz publicada
  *   /api/instrucciones→ cómo conectar el script con este panel
  *   /dist/<archivo>   → paquete tar.gz del script
  *
@@ -12,10 +19,12 @@
  *   GET  /api/status    → estado del servidor (heartbeat)
  *   POST /api/heartbeat → el script reporta que está vivo (o que se apagó)
  *   POST /api/publicar  → publica una versión nueva del script
+ *   POST /api/ui        → publica la interfaz (html/js/css); reemplazo completo
  *   POST /api/plugins   → actualiza el registro de plugins
  *
- * Almacenamiento: un namespace KV (binding ESTADO) con las claves
- * manifest, plugins, estado y paquete (base64 del tar.gz).
+ * Almacenamiento: un namespace KV (binding ESTADO) con las claves manifest,
+ * plugins, estado y paquete (base64 del tar.gz), más ui:<ruta> (cada archivo
+ * de la interfaz) y ui_indice (rutas + sha256 + metadatos).
  */
 
 import { HTML_PANEL } from "./dashboard";
@@ -24,6 +33,12 @@ import { HTML_PANEL } from "./dashboard";
 const VENTANA_ONLINE_SEG = 15 * 60;
 /** Tope de seguridad del paquete del script (KV aguanta 25 MB por valor). */
 const MAX_PAQUETE_BYTES = 20 * 1024 * 1024;
+/** Topes de la interfaz publicada (html/js/css; KV aguanta 25 MB por valor). */
+const MAX_UI_BYTES = 512 * 1024;
+const MAX_UI_TOTAL = 4 * 1024 * 1024;
+const MAX_UI_ARCHIVOS = 40;
+/** Rutas lógicas válidas de la interfaz: index.html, app.js y templates/*.css. */
+const RE_RUTA_UI = /^(?:[A-Za-z0-9_-]+\.(?:html|js)|templates\/[A-Za-z0-9_-]+\.css)$/;
 
 interface Env {
   ESTADO: KVNamespace;
@@ -111,14 +126,119 @@ function esCadenaCorta(v: unknown, max = 200): v is string {
   return typeof v === "string" && v.length > 0 && v.length <= max;
 }
 
+/** Content-Type de un archivo de la interfaz según su extensión. */
+function tipoDe(ruta: string): string {
+  if (ruta.endsWith(".html")) return "text/html; charset=utf-8";
+  if (ruta.endsWith(".js")) return "text/javascript; charset=utf-8";
+  return "text/css; charset=utf-8";
+}
+
+async function sha256Hex(texto: string): Promise<string> {
+  const resumen = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(texto));
+  return [...new Uint8Array(resumen)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Respuesta de archivo de la interfaz (sin caché: se actualiza al publicar). */
+function archivoUI(contenido: string, tipo: string, estado = 200): Response {
+  return new Response(contenido, {
+    status: estado,
+    headers: { "content-type": tipo, "cache-control": "no-store" },
+  });
+}
+
+/** Estado en formato del localhost (modo público): lo que ve la página. */
+async function estadoPublico(env: Env): Promise<Record<string, unknown>> {
+  const estado = await leerKV<Record<string, unknown> | null>(env.ESTADO, "estado", null);
+  const manifest = await leerKV<Record<string, unknown>>(env.ESTADO, "manifest", {});
+  const cuando = Number(estado?.cuando ?? 0);
+  const online = Boolean(estado?.online) && Date.now() / 1000 - cuando < VENTANA_ONLINE_SEG;
+  const versionEstado = estado?.version_script;
+  const version = esCadenaCorta(versionEstado, 40) ? versionEstado : String(manifest.version ?? "?");
+  return {
+    modo: "publico",
+    servidor: {
+      vivo: online,
+      pid: null,
+      externo: false,
+      puerto: Number(estado?.puerto ?? 25565),
+      puerto_abierto: online,
+      uptime_seg: null,
+      xmx: "",
+    },
+    tunel: {
+      vivo: online,
+      pid: null,
+      direccion: String(estado?.direccion ?? ""),
+      proveedor: String(estado?.proveedor ?? ""),
+    },
+    script: {
+      version,
+      mc: String(estado?.version_mc ?? "?"),
+      skins: "",
+      panel: "",
+    },
+    consola_disponible: false,
+    motivo: String(estado?.motivo ?? ""),
+    edad_seg: cuando ? Math.round(Date.now() / 1000 - cuando) : null,
+  };
+}
+
 async function manejar(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const ruta = url.pathname.replace(/\/+$/, "") || "/";
   const metodo = req.method.toUpperCase();
 
   // ── Público ──────────────────────────────────────────────────────────
+  // La raíz sirve la interfaz publicada (la misma que usa el script en
+  // localhost, en modo público); sin interfaz publicada, el dashboard.
   if (metodo === "GET" && ruta === "/") {
+    const html = await env.ESTADO.get("ui:index.html");
+    if (html) return archivoUI(html, "text/html; charset=utf-8");
     return texto(HTML_PANEL, 200, "text/html; charset=utf-8");
+  }
+
+  if (metodo === "GET" && ruta === "/panel") {
+    return texto(HTML_PANEL, 200, "text/html; charset=utf-8");
+  }
+
+  if (metodo === "GET" && ruta === "/app.js") {
+    const js = await env.ESTADO.get("ui:app.js");
+    if (!js) return archivoUI("// todavía no hay interfaz publicada", "text/javascript; charset=utf-8", 404);
+    return archivoUI(js, "text/javascript; charset=utf-8");
+  }
+
+  const tema = ruta.match(/^\/tema\/([A-Za-z0-9_-]+)\.css$/);
+  if (metodo === "GET" && tema) {
+    const css = await env.ESTADO.get(`ui:templates/${tema[1]}.css`);
+    if (!css) return archivoUI("/* tema no publicado */", "text/css; charset=utf-8", 404);
+    return archivoUI(css, "text/css; charset=utf-8");
+  }
+
+  if (metodo === "GET" && ruta === "/api/estado") {
+    return json(await estadoPublico(env));
+  }
+
+  if (metodo === "GET" && ruta === "/api/temas") {
+    const indice = await leerKV<{ archivos?: Array<Record<string, unknown>> }>(
+      env.ESTADO, "ui_indice", { archivos: [] });
+    const temas = (indice.archivos ?? [])
+      .map((a) => String(a.ruta ?? ""))
+      .filter((r) => r.startsWith("templates/") && r.endsWith(".css"))
+      .map((r) => r.slice("templates/".length, -".css".length));
+    temas.sort((a, b) => (a === "template_default" ? -1 : b === "template_default" ? 1 : a.localeCompare(b)));
+    return json({ temas, defecto: "template_default" });
+  }
+
+  if (metodo === "GET" && ruta === "/api/ui") {
+    return json(await leerKV(env.ESTADO, "ui_indice", { archivos: [] }));
+  }
+
+  if (metodo === "GET" && ruta.startsWith("/api/ui/")) {
+    const logica = decodeURIComponent(ruta.slice("/api/ui/".length));
+    if (!RE_RUTA_UI.test(logica)) return json({ error: "ruta no válida" }, 404);
+    const contenido = await env.ESTADO.get(`ui:${logica}`);
+    if (contenido === null) return json({ error: "archivo no publicado" }, 404);
+    return archivoUI(contenido, tipoDe(logica));
   }
 
   if (metodo === "GET" && ruta === "/api/manifest") {
@@ -134,13 +254,15 @@ async function manejar(req: Request, env: Env): Promise<Response> {
     const origen = url.origin;
     return json({
       panel: origen,
+      dashboard: `${origen}/panel`,
       env: {
         PANEL_URL: origen,
         PANEL_API_KEY: "(la misma que pusiste con: npx wrangler secret put PANEL_API_KEY)",
       },
       publicar: 'python3 setup_mc.py --publicar "mensaje del cambio"',
       actualizar: "python3 setup_mc.py --actualizar  (o simplemente arrancar el script)",
-      nota: "Con PANEL_URL y PANEL_API_KEY en .env, el script consulta /api/manifest al arrancar y se actualiza solo si hay versión nueva.",
+      interfaz: "El mismo --publicar sube webui/ + templates/. La raíz (/) sirve esa interfaz en modo público y el script la descarga al arrancar para su versión localhost.",
+      nota: "Con PANEL_URL y PANEL_API_KEY en .env, el script consulta /api/manifest y /api/ui al arrancar y se actualiza solo si hay cambios.",
     });
   }
 
@@ -224,6 +346,50 @@ async function manejar(req: Request, env: Env): Promise<Response> {
     await env.ESTADO.put("paquete", paquete_b64);
     await env.ESTADO.put("manifest", JSON.stringify(manifest));
     return json({ ok: true, manifest });
+  }
+
+  if (metodo === "POST" && ruta === "/api/ui") {
+    if (!autorizado(req, env)) return sinClave();
+    let cuerpo: { version?: unknown; archivos?: unknown };
+    try {
+      cuerpo = (await req.json()) as { version?: unknown; archivos?: unknown };
+    } catch {
+      return json({ error: "el cuerpo debe ser JSON" }, 400);
+    }
+    if (typeof cuerpo.archivos !== "object" || cuerpo.archivos === null || Array.isArray(cuerpo.archivos)) {
+      return json({ error: "falta el objeto archivos" }, 400);
+    }
+    const entradas = Object.entries(cuerpo.archivos as Record<string, unknown>);
+    if (!entradas.length || entradas.length > MAX_UI_ARCHIVOS) {
+      return json({ error: `archivos debe traer entre 1 y ${MAX_UI_ARCHIVOS}` }, 400);
+    }
+    let total = 0;
+    const indice: Array<Record<string, unknown>> = [];
+    for (const [logica, contenido] of entradas) {
+      if (!RE_RUTA_UI.test(logica)) return json({ error: `ruta no válida: ${logica}` }, 400);
+      if (typeof contenido !== "string") return json({ error: `contenido no válido en ${logica}` }, 400);
+      const bytes = new TextEncoder().encode(contenido).length;
+      if (bytes > MAX_UI_BYTES) return json({ error: `${logica} supera ${MAX_UI_BYTES} bytes` }, 413);
+      total += bytes;
+      indice.push({ ruta: logica, sha256: await sha256Hex(contenido), tamano: bytes, tipo: tipoDe(logica) });
+    }
+    if (total > MAX_UI_TOTAL) return json({ error: `la interfaz supera ${MAX_UI_TOTAL} bytes` }, 413);
+    // Reemplazo completo: lo que ya no viene en el envío se borra.
+    const existentes = await env.ESTADO.list({ prefix: "ui:" });
+    const nuevas = new Set(indice.map((a) => `ui:${a.ruta}`));
+    for (const clave of existentes.keys) {
+      if (!nuevas.has(clave.name)) await env.ESTADO.delete(clave.name);
+    }
+    for (const [logica, contenido] of entradas) {
+      await env.ESTADO.put(`ui:${logica}`, contenido as string);
+    }
+    const meta = {
+      version: esCadenaCorta(cuerpo.version, 40) ? cuerpo.version : "",
+      cuando: Date.now() / 1000,
+      archivos: indice,
+    };
+    await env.ESTADO.put("ui_indice", JSON.stringify(meta));
+    return json({ ok: true, ...meta });
   }
 
   if (metodo === "POST" && ruta === "/api/plugins") {

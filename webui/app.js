@@ -55,6 +55,32 @@ async function cargarTemas() {
 }
 
 // ── estado en vivo ────────────────────────────────────────────────────────
+let modo = "local";         // "local" (localhost) o "publico" (página del panel)
+let direccionActual = "";   // dirección del túnel, para copiar al clic
+
+function hace(segundos) {
+  if (segundos == null) return "";
+  if (segundos < 90) return "hace " + Math.round(segundos) + " s";
+  if (segundos < 5400) return "hace " + Math.round(segundos / 60) + " min";
+  return "hace " + (segundos / 3600).toFixed(1) + " h";
+}
+
+function copiarDireccion() {
+  if (direccionActual && navigator.clipboard) navigator.clipboard.writeText(direccionActual);
+}
+
+// La misma página sirve en localhost (todo) y en el panel (solo mirar).
+function aplicarModo(nuevo) {
+  if (nuevo === modo) return;
+  modo = nuevo;
+  document.body.classList.toggle("modo-publico", modo === "publico");
+  $("marca-texto").textContent = modo === "publico" ? "estado del servidor" : "panel local";
+  $("pie").innerHTML = modo === "publico"
+    ? "estado en vivo del servidor · se actualiza solo"
+    : 'consola: <code>logs/servidor.log</code> · comandos: <code>consola</code> (fifo) · ' +
+      'html/js: <code>webui/</code> · temas: <code>templates/</code>';
+}
+
 function fila(etiqueta, valor) {
   return `<div class="fila"><span class="etiqueta">${escapar(etiqueta)}</span>` +
          `<span class="valor">${valor}</span></div>`;
@@ -69,6 +95,7 @@ async function refrescarEstado() {
     $("indicador-texto").textContent = "ui sin conexión";
     return;
   }
+  aplicarModo(e.modo || "local");
   const s = e.servidor || {}, t = e.tunel || {}, sc = e.script || {};
   const enMarcha = !!(s.vivo && s.puerto_abierto);
 
@@ -83,23 +110,40 @@ async function refrescarEstado() {
   html += fila("puerto", `${s.puerto} · ${s.puerto_abierto ? "abierto" : "cerrado"}`);
   if (enMarcha && s.uptime_seg != null) html += fila("en pie desde hace", escapar(duracion(s.uptime_seg)));
   if (enMarcha && s.xmx) html += fila("memoria máx.", escapar(s.xmx));
-  html += fila("túnel", t.vivo
-    ? escapar(t.direccion || "(abriendo…)") + (t.proveedor ? ` <span class="tenue">· ${escapar(t.proveedor)}</span>` : "")
-    : "sin túnel");
+  if (t.vivo) {
+    direccionActual = t.direccion || "";
+    const dir = t.direccion
+      ? `<span class="copiable" title="clic para copiar" onclick="copiarDireccion()">${escapar(t.direccion)}</span>`
+      : "(abriendo…)";
+    html += fila("túnel", dir +
+      (t.proveedor ? ` <span class="tenue">· ${escapar(t.proveedor)}</span>` : ""));
+  } else {
+    html += fila("túnel", "sin túnel");
+  }
   html += fila("minecraft", escapar(sc.mc || "?"));
   html += fila("script", "v" + escapar(sc.version || "?"));
-  html += fila("skinsrestorer", escapar(sc.skins || "?"));
+  if (sc.skins) html += fila("skinsrestorer", escapar(sc.skins));
   if (sc.panel) {
     const limpio = String(sc.panel).replace(/^https?:\/\//, "");
     html += fila("panel remoto",
       `<a href="${escapar(sc.panel)}" target="_blank" rel="noopener">${escapar(limpio)}</a>`);
   }
-  html += fila("consola", e.consola_disponible ? "canal listo" : "no disponible (servidor parado)");
+  if (modo !== "publico") {
+    html += fila("consola", e.consola_disponible ? "canal listo" : "no disponible (servidor parado)");
+  }
+  if (modo === "publico" && e.edad_seg != null) {
+    html += fila("última señal", escapar(hace(e.edad_seg)));
+  }
+  if (modo === "publico" && e.motivo) {
+    html += fila("aviso", `<span class="tenue">${escapar(e.motivo)}</span>`);
+  }
 
   $("estado-filas").innerHTML = html;
 
-  $("btn-arrancar").disabled = enMarcha;
-  $("btn-parar").disabled = !enMarcha && !t.vivo;
+  if (modo !== "publico") {
+    $("btn-arrancar").disabled = enMarcha;
+    $("btn-parar").disabled = !enMarcha && !t.vivo;
+  }
 }
 
 // ── consola ───────────────────────────────────────────────────────────────
@@ -160,6 +204,7 @@ function irAlFinal() {
 }
 
 async function refrescarConsola() {
+  if (modo === "publico") return;     // en el panel no hay consola
   let r;
   try {
     r = await (await fetch("/api/consola?desde=" + desde)).json();
@@ -192,6 +237,7 @@ function agregarEco(texto, error = false) {
 }
 
 async function enviarComando() {
+  if (modo === "publico") return;     // los comandos solo existen en localhost
   const entrada = $("comando");
   const cmd = entrada.value.trim();
   if (!cmd) return;
@@ -237,6 +283,7 @@ function navegarHistorial(sentido) {
 
 // ── acciones ──────────────────────────────────────────────────────────────
 async function accion(nombre, confirmar) {
+  if (modo === "publico") return;     // las acciones solo existen en localhost
   if (confirmar && !window.confirm(confirmar)) return;
   const aviso = $("aviso-accion");
   aviso.textContent = `${nombre}: en curso…`;
@@ -296,7 +343,10 @@ $("btn-apagar").addEventListener("click", () => {
 });
 
 cargarTemas();
-refrescarEstado();
-refrescarConsola();
+refrescarEstado().then(() => {
+  if (modo !== "publico") {           // la consola solo corre en localhost
+    refrescarConsola();
+    setInterval(refrescarConsola, 1500);
+  }
+});
 setInterval(refrescarEstado, 3000);
-setInterval(refrescarConsola, 1500);

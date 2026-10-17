@@ -332,6 +332,12 @@ def actualizar_al_arrancar(manual: bool = False) -> bool:
         if manual:
             error("El panel no está configurado: añade PANEL_URL al .env.")
         return False
+    # La interfaz (html/js/css) va aparte del script: se comprueba siempre, y
+    # también cuando el script ya se actualizó en este mismo arranque.
+    try:
+        actualizar_ui()
+    except (requests.RequestException, OSError, ValueError):
+        pass
     if not manual and os.environ.get(_VAR_GUARD):
         aviso(f"Panel: ya se actualizó a v{os.environ[_VAR_GUARD]} en este arranque.")
         return False
@@ -344,6 +350,139 @@ def actualizar_al_arrancar(manual: bool = False) -> bool:
     if manual and not hecho:
         ok(f"Panel: no hay nada que actualizar (v{config.VERSION_SCRIPT} al día).")
     return hecho
+
+
+# ─── Interfaz publicada (webui/ + templates/) ────────────────────────────
+# La misma interfaz que sirve el localhost se sube al panel como página
+# pública (/) y el script la baja al arrancar si cambió (sha256 por archivo).
+RE_UI_HTML = re.compile(r"^[A-Za-z0-9_-]+\.html$")
+RE_UI_JS = re.compile(r"^[A-Za-z0-9_-]+\.js$")
+RE_UI_CSS = re.compile(r"^templates/[A-Za-z0-9_-]+\.css$")
+MAX_UI_BYTES = 512 * 1024
+
+
+def rutas_ui(base: Path = BASE_DIR) -> dict:
+    """{ruta lógica: ruta local} de la interfaz publicable.
+
+    La ruta lógica es la que usa el panel: index.html, app.js y
+    templates/<tema>.css (las que referencia la propia página).
+    """
+    mapa = {}
+    for carpeta, sufijos, prefijo in (
+            (base / "webui", (".html", ".js"), ""),
+            (base / "templates", (".css",), "templates/")):
+        if not carpeta.is_dir():
+            continue
+        for ruta in sorted(carpeta.iterdir()):
+            if ruta.is_file() and ruta.suffix in sufijos:
+                mapa[f"{prefijo}{ruta.name}"] = ruta
+    return mapa
+
+
+def _destino_ui(logica: str, base: Path = BASE_DIR):
+    """Ruta local donde vive (o debe vivir) un archivo lógico del panel."""
+    if RE_UI_HTML.fullmatch(logica) or RE_UI_JS.fullmatch(logica):
+        return base / "webui" / logica
+    if RE_UI_CSS.fullmatch(logica):
+        return base / "templates" / logica.split("/", 1)[1]
+    return None
+
+
+def publicar_ui(version: str = "") -> bool:
+    """Sube webui/ + templates/ al panel: la página pública y sus archivos."""
+    url, clave = config_panel()
+    if not url or not clave:
+        aviso("Panel: faltan PANEL_URL y/o PANEL_API_KEY en el .env; "
+              "no se publica la interfaz.")
+        return False
+    archivos = {}
+    for logica, ruta in rutas_ui().items():
+        try:
+            archivos[logica] = ruta.read_text(errors="replace")
+        except OSError:
+            continue
+    if not archivos:
+        aviso("Panel: no hay interfaz que publicar (¿faltan webui/ y templates/?).")
+        return False
+    cuerpo = {"version": version or config.VERSION_SCRIPT, "archivos": archivos}
+    log(f"Panel: publicando la interfaz ({len(archivos)} archivos)...")
+    try:
+        r = requests.post(f"{url}/api/ui", json=cuerpo, headers=_cabeceras(), timeout=60)
+    except requests.RequestException as exc:
+        error(f"Panel: no se pudo publicar la interfaz: {exc}")
+        return False
+    if r.status_code == 401:
+        error("El panel rechazó la clave (PANEL_API_KEY).")
+        return False
+    if not r.ok:
+        error(f"Panel: la interfaz fue rechazada: {r.status_code} {r.text[:300]}")
+        return False
+    ok(f"Panel: interfaz publicada ({len(archivos)} archivos); se ve en {url}/")
+    return True
+
+
+def actualizar_ui(base: Path | None = None) -> int:
+    """Baja la interfaz del panel si cambió (sha256). Nº de archivos actualizados.
+
+    Nunca aborta nada: sin panel, sin red o con respuestas raras se sigue con
+    los archivos locales. Antes de reemplazar algo se resguarda fuera del repo.
+    """
+    base = base or BASE_DIR
+    url, _ = config_panel()
+    if not url:
+        return 0
+    try:
+        r = requests.get(f"{url}/api/ui", headers=_cabeceras(), timeout=8)
+        r.raise_for_status()
+        indice = r.json()
+    except (requests.RequestException, ValueError):
+        return 0
+    if not isinstance(indice, dict):
+        return 0
+    actualizados = 0
+    respaldo = _ESTADO_LOCAL / f"ui-antigua-{time.strftime('%Y%m%d-%H%M%S')}"
+    for info in indice.get("archivos", []):
+        if not isinstance(info, dict):
+            continue
+        logica = str(info.get("ruta") or "")
+        sha = str(info.get("sha256") or "")
+        destino = _destino_ui(logica, base)
+        if destino is None or not re.fullmatch(r"[0-9a-f]{64}", sha):
+            continue
+        try:
+            if int(info.get("tamano") or 0) > MAX_UI_BYTES:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if destino.is_file() and _sha256(destino) == sha:
+            continue
+        try:
+            descarga = requests.get(f"{url}/api/ui/{logica}", headers=_cabeceras(), timeout=30)
+            descarga.raise_for_status()
+        except requests.RequestException:
+            continue
+        contenido = descarga.content
+        if hashlib.sha256(contenido).hexdigest() != sha:
+            aviso(f"Panel: {logica} no coincide con su sha256; se conserva el local.")
+            continue
+        if destino.is_file():
+            copia = respaldo / logica
+            try:
+                copia.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(destino, copia)
+            except OSError:
+                pass
+        try:
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            destino.write_bytes(contenido)
+        except OSError as exc:
+            aviso(f"Panel: no se pudo escribir {logica}: {exc}")
+            continue
+        actualizados += 1
+        log(f"Panel: interfaz actualizada ({logica}).")
+    if actualizados:
+        ok(f"Panel: {actualizados} archivo/s de la interfaz al día.")
+    return actualizados
 
 
 # ─── Publicar una versión nueva ──────────────────────────────────────────
@@ -398,4 +537,5 @@ def publicar(mensaje: str, version: str = "") -> bool:
         error(f"El panel devolvió un error: {r.status_code} {r.text[:300]}")
         return False
     ok(f"Versión v{version} publicada. Las demás máquinas se actualizarán al arrancar.")
+    publicar_ui(version)   # la interfaz (webui/ + templates/) viaja con el script
     return True

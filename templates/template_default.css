@@ -253,3 +253,19 @@ button.mini {
   font-family: inherit;
   border-bottom: 1px dotted var(--rojo-oscuro);
 }
+
+/* ── modo público (la interfaz servida por el panel) ─────────────────── */
+/* La misma página, sin consola ni acciones: solo el estado del servidor. */
+.modo-publico .rejilla {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "estado";
+  max-width: 760px;
+}
+.modo-publico #panel-acciones,
+.modo-publico #panel-consola { display: none; }
+
+.copiable {
+  cursor: pointer;
+  border-bottom: 1px dotted var(--rojo-oscuro);
+}
+.copiable:hover { color: var(--rojo-vivo); }
