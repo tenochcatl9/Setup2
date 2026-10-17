@@ -2,6 +2,7 @@
 
 import subprocess
 from pathlib import Path
+from . import panel
 from . import tuneles
 from .config import LOG_SERVIDOR, LOG_TUNEL, PID_SERVIDOR, PID_TUNEL, SERVER_DIR
 from .ui import _sin_ansi, aviso, error, log, ok, titulo
@@ -103,6 +104,13 @@ def modo_notificacion(args) -> int:
     # 4. Aviso con la IP (o con el motivo del fallo)
     notificar_servidor(webhook, direccion, args.puerto, tuneles.MOTIVO_FALLO_TUNEL)
 
+    # 4b. Panel: latidos en vivo mientras el servidor siga de fondo
+    pid_srv = _leer_pid(PID_SERVIDOR)
+    motivo_panel = "" if direccion else tuneles.MOTIVO_FALLO_TUNEL
+    if panel.lanzar_latidor_desacoplado(pid_srv, direccion, args.puerto,
+                                        proveedor_usado, motivo_panel):
+        ok("Panel: enviando estado en vivo (latido cada 5 min).")
+
     # 4. Panel con cómo pararlo
     print()
     print("=" * 62)
@@ -118,6 +126,8 @@ def modo_notificacion(args) -> int:
     print("  Login         : AuthMe  (regístrate la primera vez, luego /login)")
     print(f"  Servidor PID  : {_leer_pid(PID_SERVIDOR) or '?'}   (log: {LOG_SERVIDOR})")
     print(f"  Túnel PID     : {_leer_pid(PID_TUNEL) or '?'}   (log: {LOG_TUNEL})")
+    if panel.hay_panel():
+        print(f"  Panel         : {panel.config_panel()[0]}  (estado en vivo y auto-actualización)")
     print()
     for extra in avisos_tunel:
         aviso(extra)

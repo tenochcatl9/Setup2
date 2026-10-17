@@ -3,6 +3,7 @@
 import hashlib, json, re, time
 from pathlib import Path
 import requests
+from . import panel
 from .config import PLUGINS_DIR
 from .ui import Barra, aviso, log, ok
 from .versiones import rango_versiones
@@ -27,6 +28,22 @@ CARGA_SKINSRESTORER = ["paper", "purpur", "spigot", "bukkit"]
 # Última versión instalada de cada plugin que se reza actualiza; comparte
 # carpeta con ESTADO_RESPALDO (~/.local/state/setup_mc/).
 ESTADO_PLUGINS = Path.home() / ".local" / "state" / "setup_mc" / "plugins.json"
+
+# Lista de plugins por defecto. El panel puede sobrescribirla sin tocar el
+# código (POST /api/plugins): aquí solo queda lo que se instala si no hay
+# panel o la API no responde.
+PLUGINS_DEFECTO = [
+    {"id": "viaversion", "nombre": PLUGIN_VIAVERSION, "fuente": "github",
+     "repo": "ViaVersion/ViaVersion", "en_cada_ejecucion": False},
+    {"id": "viabackwards", "nombre": PLUGIN_VIABACKWARDS, "fuente": "github",
+     "repo": "ViaVersion/ViaBackwards", "en_cada_ejecucion": False},
+    {"id": "authme", "nombre": PLUGIN_AUTHME, "fuente": "github",
+     "repo": "AuthMe/AuthMeReloaded", "preferir": "-Paper.jar|AuthMe.jar",
+     "en_cada_ejecucion": False},
+    {"id": "skinsrestorer", "nombre": PLUGIN_SKINSRESTORER, "fuente": "modrinth",
+     "proyecto": PROYECTO_SKINSRESTORER, "carga": CARGA_SKINSRESTORER,
+     "en_cada_ejecucion": True},
+]
 
 def _elegir_asset(release: dict, repo: str, preferido: str = "") -> dict:
     """Escoge el .jar correcto: por sufijo preferido o el primero válido."""
@@ -102,29 +119,29 @@ def _guardar_estado_plugins(nombre: str, datos: dict) -> None:
 def version_skinsrestorer() -> str:
     return _leer_estado_plugins().get(PROYECTO_SKINSRESTORER, {}).get("version", "?")
 
-def actualizar_skinsrestorer() -> str:
-    """Deja siempre la última versión de SkinsRestorer (se comprueba en cada
-    ejecución, a diferencia de los plugins de GitHub que solo se instalan una vez).
+def actualizar_plugin_modrinth(proyecto: str, nombre_archivo: str, carga: list) -> str:
+    """Deja siempre la última versión de un plugin de Modrinth.
 
     Se compara el sha1 del jar local con el que publica Modrinth: así se
-    detectan versiones nuevas sin volver a bajar 8 MB cuando nada ha cambiado.
+    detectan versiones nuevas sin volver a bajar el jar cuando nada cambió.
     """
-    destino = PLUGINS_DIR / PLUGIN_SKINSRESTORER
+    destino = PLUGINS_DIR / nombre_archivo
+    carga = [c for c in carga if c] or CARGA_SKINSRESTORER
     cabeceras = {"User-Agent": "setup-mc (respaldo servidor minecraft)"}
-    url = f"https://api.modrinth.com/v2/project/{PROYECTO_SKINSRESTORER}/version"
-    r = requests.get(url, params={"loaders": json.dumps(CARGA_SKINSRESTORER)},
+    url = f"https://api.modrinth.com/v2/project/{proyecto}/version"
+    r = requests.get(url, params={"loaders": json.dumps(carga)},
                      headers=cabeceras, timeout=25)
     r.raise_for_status()
     versiones = [v for v in r.json() if v.get("files")]
     if not versiones:
-        raise RuntimeError("Modrinth no devolvió ninguna versión de SkinsRestorer.")
+        raise RuntimeError(f"Modrinth no devolvió ninguna versión de {proyecto}.")
     version = versiones[0]
     archivo = version["files"][0]
     sha1 = archivo["hashes"]["sha1"]
     if destino.is_file() and _sha1_archivo(destino) == sha1:
-        log(f"SkinsRestorer ya está al día: v{version['version_number']}.")
+        log(f"{nombre_archivo} ya está al día: v{version['version_number']}.")
         return version["version_number"]
-    barra = Barra(f"Descargando SkinsRestorer {version['version_number']}",
+    barra = Barra(f"Descargando {nombre_archivo} {version['version_number']}",
                   total=int(archivo.get("size") or 0) or None)
     PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
     temporal = destino.with_suffix(".jar.part")
@@ -138,15 +155,21 @@ def actualizar_skinsrestorer() -> str:
                         barra.avanzar(len(bloque))
     if _sha1_archivo(temporal) != sha1:
         temporal.unlink(missing_ok=True)
-        raise RuntimeError("El jar de SkinsRestorer no coincide con su sha1 en Modrinth.")
+        raise RuntimeError(f"El jar de {nombre_archivo} no coincide con su sha1 en Modrinth.")
     temporal.replace(destino)
-    barra.finalizar(f"SkinsRestorer v{version['version_number']} en {destino}")
-    _guardar_estado_plugins(PROYECTO_SKINSRESTORER, {
+    barra.finalizar(f"{nombre_archivo} v{version['version_number']} en {destino}")
+    _guardar_estado_plugins(proyecto, {
         "version": version["version_number"],
         "sha1": sha1,
         "actualizado": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
     return version["version_number"]
+
+
+def actualizar_skinsrestorer() -> str:
+    """Compatibilidad: SkinsRestorer es un plugin de Modrinth más."""
+    return actualizar_plugin_modrinth(PROYECTO_SKINSRESTORER, PLUGIN_SKINSRESTORER,
+                                      CARGA_SKINSRESTORER)
 
 CONFIG_AUTHME = PLUGINS_DIR / "AuthMe" / "config.yml"
 
@@ -213,20 +236,38 @@ def configurar_authme() -> bool:
             cambiado = True
     return cambiado
 
+def _plugins_del_panel() -> list:
+    """Lista de plugins del panel; si no hay API disponible, la de siempre."""
+    lista = panel.lista_plugins()
+    if lista is None:
+        if panel.hay_panel():
+            aviso("No se pudo leer la lista de plugins del panel; "
+                  "se usan los plugins de siempre.")
+        return PLUGINS_DEFECTO
+    log(f"Panel: lista de plugins cargada de la API ({len(lista)}).")
+    return lista
+
+
 def instalar_plugins(forzar: bool = False) -> None:
     PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
-    descargar_plugin_github("ViaVersion/ViaVersion", PLUGIN_VIAVERSION, forzar)
-    descargar_plugin_github("ViaVersion/ViaBackwards", PLUGIN_VIABACKWARDS, forzar)
-    # AuthMe: login/registro. Paper build (no Bungee/Velocity/Folia/Spigot).
-    descargar_plugin_github("AuthMe/AuthMeReloaded", PLUGIN_AUTHME, forzar,
-                            preferir="-Paper.jar|AuthMe.jar")
+    versiones = {}
+    for p in _plugins_del_panel():
+        fuente = str(p.get("fuente") or "github")
+        nombre_archivo = str(p["nombre"])
+        try:
+            if fuente == "modrinth":
+                versiones[nombre_archivo] = actualizar_plugin_modrinth(
+                    str(p["proyecto"]), nombre_archivo, list(p.get("carga") or []))
+            else:
+                descargar_plugin_github(str(p["repo"]), nombre_archivo,
+                                        forzar or bool(p.get("en_cada_ejecucion")),
+                                        str(p.get("preferir") or ""))
+        except (requests.RequestException, RuntimeError, KeyError, TypeError) as exc:
+            aviso(f"No se pudo instalar {nombre_archivo}: {exc}")
     configurar_authme()
-    # SkinsRestorer sí se revisa en cada ejecución (cambia a menudo y sin
-    # avisos de versión nueva). Si Modrinth falla, el servidor arranca igual.
-    try:
-        version_skin = actualizar_skinsrestorer()
-    except (requests.RequestException, RuntimeError, KeyError) as exc:
-        version_skin = "?"
-        aviso(f"No se pudo comprobar SkinsRestorer en Modrinth: {exc}")
+    # SkinsRestorer (si está en la lista) sí se revisa en cada ejecución: cambia
+    # a menudo y sin avisos de versión nueva. Si Modrinth falla, el servidor
+    # arranca igual.
+    version_skin = versiones.get(PLUGIN_SKINSRESTORER) or version_skinsrestorer()
     ok(f"Plugins listos: {rango_versiones()} vía ViaVersion/ViaBackwards, "
        f"login con AuthMe y SkinsRestorer {version_skin}.")

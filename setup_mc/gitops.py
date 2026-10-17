@@ -65,8 +65,17 @@ def _contenido_gitignore() -> str:
         # misma línea se añade aquí sola hasta que vuelva a caber.
         "respaldo/mundo-*.tar.zst",
         # Carpeta de la versión anterior del script; se ignora por si queda
-        # alguna whilst no se haya reiniciado con el código nuevo.
+        # alguna que no se haya reiniciado con el código nuevo.
         "respaldo/auto/",
+        "",
+        "# Panel del Worker (Cloudflare): se versiona el código, no los secretos",
+        "panel/node_modules/",
+        "panel/.wrangler/",
+        "panel/dist/",
+        "panel/.dev.vars",
+        "panel/.dev.vars.*",
+        "!panel/.dev.vars.example",
+        ".actualizacion-*/",
         "",
         "# Python",
         "__pycache__/",
@@ -105,9 +114,15 @@ def configurar_gitignore():
         log(f".gitignore creado en {GITIGNORE_FILE}")
     if not ENV_EJEMPLO.exists():
         ENV_EJEMPLO.write_text(
-            "# Copia este archivo a .env y rellena el webhook.\n"
+            "# Copia este archivo a .env y rellena lo que uses.\n"
             "# .env está en .gitignore: nunca se sube.\n"
             "DISCORD_WEBHOOK=\n"
+            "\n"
+            "# Panel (Cloudflare Workers): auto-actualización, plugins y estado en vivo.\n"
+            "# Despliega el Worker de panel/ (ver panel/README.md) y pega aquí su URL\n"
+            "# y la misma clave que pusiste con: npx wrangler secret put PANEL_API_KEY\n"
+            "PANEL_URL=\n"
+            "PANEL_API_KEY=\n"
         )
         log(f"{ENV_EJEMPLO.name} creado como plantilla.")
 

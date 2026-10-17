@@ -52,6 +52,15 @@ consola
 respaldo/mundo-*.tar.zst
 respaldo/auto/
 
+# Panel del Worker (Cloudflare): se versiona el código, no los secretos
+panel/node_modules/
+panel/.wrangler/
+panel/dist/
+panel/.dev.vars
+panel/.dev.vars.*
+!panel/.dev.vars.example
+.actualizacion-*/
+
 # Python
 __pycache__/
 *.py[cod]

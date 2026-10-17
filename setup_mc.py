@@ -26,6 +26,12 @@ Modos:
   python3 setup_mc.py --probar-webhook comprueba el webhook de Discord y sale
   python3 setup_mc.py --importar owner/repo
                                        restaura el mundo desde un .tar.zst
+  python3 setup_mc.py --publicar "msg" publica esta versión del script en el panel
+  python3 setup_mc.py --actualizar     aplica la última versión publicada y sale
+
+Panel (opcional, ver panel/README.md): con PANEL_URL y PANEL_API_KEY en .env
+el script se auto-actualiza al arrancar (--sin-actualizar lo desactiva),
+consulta de la API la lista de plugins y reporta estado en vivo cada 5 min.
 
 Antes de subir cambios a la rama principal se comprime el servidor en
 respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con
@@ -38,7 +44,9 @@ responde, el script cae automáticamente a Pinggy (solo ssh, sin cuenta).
 """
 
 import argparse, signal, sys
+from setup_mc import config
 from setup_mc import mcserver
+from setup_mc import panel
 from setup_mc import tuneles
 from setup_mc.avisos import enviar_a_discord, notificar_apagado, notificar_servidor, obtener_webhook
 from setup_mc.config import PID_SERVIDOR, PID_TUNEL, PUERTO_MC, SERVER_DIR, SERVER_JAR
@@ -109,6 +117,12 @@ def parse_args():
     p.add_argument("--importar", metavar="URL", default="",
                    help="Importa un respaldo (owner/repo, URL de GitHub o URL directa)")
     p.add_argument("--reinstalar-plugins", action="store_true", help="Volver a descargar los plugins")
+    p.add_argument("--sin-actualizar", action="store_true",
+                   help="No buscar versiones nuevas del script en el panel")
+    p.add_argument("--actualizar", action="store_true",
+                   help="Busca y aplica la última versión del panel, y sale")
+    p.add_argument("--publicar", metavar="MENSAJE", default=None,
+                   help="Publica esta versión del script en el panel y sale")
     p.add_argument("--rama", default="main", help="Rama a la que se empuja (main)")
     return p.parse_args()
 
@@ -195,17 +209,28 @@ def main():
     except (ValueError, OSError):
         pass
 
+    # 0. Panel: publicar, actualizar o comprobar versión nueva antes de nada
+    if args.publicar is not None:
+        return 0 if panel.publicar(args.publicar) else 1
+    if args.actualizar:
+        panel.actualizar_al_arrancar(manual=True)
+        return 0
+    if not args.sin_actualizar:
+        panel.actualizar_al_arrancar()
+
     titulo("SETUP SERVIDOR MINECRAFT PAPER + TÚNEL PÚBLICO")
     log(f"Directorio del servidor (raíz local): {SERVER_DIR}")
     log(f"JAR del servidor: {SERVER_JAR}")
+    if panel.hay_panel():
+        log(f"Panel: {panel.config_panel()[0]}  (script v{config.VERSION_SCRIPT})")
 
-    # 0. Requisitos y secretos: si .env no está oculto, se cancela aquí
+    # 0a. Requisitos y secretos: si .env no está oculto, se cancela aquí
     version_java = comprobar_java()
     ok(f"Java {version_java} detectado.")
     configurar_gitignore()
     exigir_env_protegido()
 
-    # 0a. Alta de Asyx (registro en el navegador del usuario)
+    # 0b. Alta de Asyx (registro en el navegador del usuario)
     if args.registrar_asyx:
         if asyx_esta_alto():
             ok("Asyx ya está dado de alta; no hace falta registrarlo.")
@@ -216,11 +241,11 @@ def main():
             return 1
         return 0 if asyx_registrar() else 1
 
-    # 0b. Diagnóstico del túnel
+    # 0c. Diagnóstico del túnel
     if args.tunel_diag:
         return diagnostico_tunel()
 
-    # 0bis. Comprobación rápida del webhook (falla en 1s si está muerto)
+    # 0d. Comprobación rápida del webhook (falla en 1s si está muerto)
     if args.probar_webhook:
         webhook = obtener_webhook()
         if not webhook:
@@ -279,6 +304,14 @@ def main():
 
         listo_para_subir = True
 
+        # 3b. Panel: latidos cada 5 min mientras el servidor siga vivo (y
+        # aviso de apagado cuando se detenga, aunque el script ya no esté).
+        motivo_panel = "" if direccion else tuneles.MOTIVO_FALLO_TUNEL
+        if panel.lanzar_latidor_desacoplado(servidor_proc.pid, direccion,
+                                            args.puerto, proveedor_usado,
+                                            motivo_panel):
+            log("Panel: enviando estado en vivo (latido cada 5 min).")
+
         # 4. Discord (siempre: con la IP o con el motivo del fallo)
         motivo = tuneles.MOTIVO_FALLO_TUNEL
         if args.sin_tunnel:
@@ -295,6 +328,8 @@ def main():
         print(f"  Dirección MC : {direccion or '(sin túnel)'}")
         if proveedor_usado:
             print(f"  Servicio     : {PROVEEDORES[proveedor_usado]['nombre']}")
+        if panel.hay_panel():
+            print(f"  Panel        : {panel.config_panel()[0]}  (estado y actualizaciones)")
         print(f"  Versiones    : {rango_versiones()}  (ViaVersion + ViaBackwards)")
         print(f"  Skins        : SkinsRestorer {version_skinsrestorer()}  (se actualiza al correr)")
         print("  Login        : AuthMe  (regístrate la primera vez, luego /login)")

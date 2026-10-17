@@ -1,0 +1,4 @@
+# La misma clave que pondrás en wrangler secret put PANEL_API_KEY
+# y en el .env del script (PANEL_API_KEY=...). Genera una con:
+#   openssl rand -hex 24
+PANEL_API_KEY=pon-aqui-una-clave-larga-aleatoria
