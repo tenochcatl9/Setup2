@@ -5,7 +5,7 @@ from pathlib import Path
 from . import panel
 from . import tuneles
 from .config import LOG_SERVIDOR, LOG_TUNEL, PID_SERVIDOR, PID_TUNEL, SERVER_DIR
-from .ui import _sin_ansi, aviso, error, log, ok, titulo
+from .ui import aviso, error, log, ok, titulo
 from .procesos import _abrir_log, _lanzar_puente_consola, _leer_pid, _limpiar_pid, _matar_pid, _vivo, args_sin_backup_auto, puerto_abierto
 from .versiones import rango_versiones
 from .mcserver import cmd_servidor, esperar_puerto
@@ -14,26 +14,10 @@ from .avisos import notificar_servidor, obtener_webhook
 from .tuneles import NotificadorTunel, PROVEEDORES, _listo_para_verificar, abrir_tunel_detached
 from .respaldo import BACKUP_AUTO_MANTENER, BACKUP_AUTO_MINUTOS, arrancar_backups_auto, subir_cambios
 
-def direccion_en_log(ruta: Path) -> str:
-    """Última dirección pública de túnel que aparece en su log.
-
-    Se prueban los parsers de todos los proveedores: así sirve para recuperar
-    un túnel anterior sin saber cuál se usó.
-    """
-    try:
-        texto = _sin_ansi(ruta.read_text(errors="replace"))
-    except OSError:
-        return ""
-    for prov in PROVEEDORES.values():
-        direccion = prov["parsear"](texto)
-        if direccion:
-            return direccion
-    return ""
-
 def arrancar_servidor_detached(puerto: int):
     """Arranca el servidor desacoplado: sobrevive a la salida del script."""
     log(f"Arrancando servidor en segundo plano (puerto {puerto})...")
-    mango = _abrir_log(LOG_SERVIDOR)
+    mango = _abrir_log(LOG_SERVIDOR, truncar=True)
     try:
         proc = subprocess.Popen(
             cmd_servidor(puerto), cwd=str(SERVER_DIR), stdin=subprocess.PIPE,
@@ -89,7 +73,7 @@ def modo_notificacion(args) -> int:
     proveedor_usado = ""
     pid_tunel = _leer_pid(PID_TUNEL)
     if _vivo(pid_tunel):
-        previa = direccion_en_log(LOG_TUNEL)
+        previa = tuneles.direccion_en_log(LOG_TUNEL)
         if previa and _listo_para_verificar(previa):
             direccion = previa
             ok(f"El túnel anterior sigue vivo (PID {pid_tunel}): {direccion}")
@@ -111,7 +95,16 @@ def modo_notificacion(args) -> int:
                                         proveedor_usado, motivo_panel):
         ok("Panel: enviando estado en vivo (latido cada 5 min).")
 
-    # 4. Panel con cómo pararlo
+    # 4c. UI local en segundo plano (sobrevive a la salida del script: sirve
+    # para ver la consola y controlar el servidor desde el navegador).
+    puerto_ui = None
+    if not getattr(args, "sin_ui", False):
+        from . import webui  # import tardío: estado no depende de webui al cargar
+        puerto_ui = webui.lanzar_desacoplado(getattr(args, "puerto_ui", 8080))
+        if puerto_ui:
+            ok(f"UI local: {webui.url_local(puerto_ui)}")
+
+    # 5. Panel con cómo pararlo
     print()
     print("=" * 62)
     print("  SERVIDOR Y TÚNEL EN SEGUNDO PLANO")
@@ -128,6 +121,11 @@ def modo_notificacion(args) -> int:
     print(f"  Túnel PID     : {_leer_pid(PID_TUNEL) or '?'}   (log: {LOG_TUNEL})")
     if panel.hay_panel():
         print(f"  Panel         : {panel.config_panel()[0]}  (estado en vivo y auto-actualización)")
+    if puerto_ui:
+        print(f"  UI local      : {webui.url_local(puerto_ui)}")
+        reenviada = webui.url_codespaces(puerto_ui)
+        if reenviada:
+            print(f"  UI reenviada  : {reenviada}  (pestaña PORTS)")
     print()
     for extra in avisos_tunel:
         aviso(extra)

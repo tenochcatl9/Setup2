@@ -13,6 +13,22 @@ MOTIVO_FALLO_TUNEL = ""
 
 BARRA_DISCORD = "▓▓▓▓▓▓▓░░░"
 
+def direccion_en_log(ruta) -> str:
+    """Última dirección pública de túnel que aparece en su log.
+
+    Se prueban los parsers de todos los proveedores: así sirve para recuperar
+    un túnel anterior sin saber cuál se usó.
+    """
+    try:
+        texto = _sin_ansi(ruta.read_text(errors="replace"))
+    except OSError:
+        return ""
+    for prov in PROVEEDORES.values():
+        direccion = prov["parsear"](texto)
+        if direccion:
+            return direccion
+    return ""
+
 def _barra_texto(frac: float) -> str:
     llenos = int(len(BARRA_DISCORD) * frac)
     return BARRA_DISCORD[:llenos] + BARRA_DISCORD[llenos:]

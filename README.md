@@ -2,8 +2,10 @@
 
 Un comando despliega un servidor Paper listo para jugar: descarga el jar, instala
 los plugins, abre un túnel público, avisa por Discord, respalda el mundo y sube
-los cambios a Git. Un panel opcional en Cloudflare (carpeta `panel/`) permite
-auto-actualizar el script, cambiar la lista de plugins y ver el estado en vivo.
+los cambios a Git. El propio script levanta una **página local de control**
+(estado, consola y acciones en el navegador); un panel opcional en Cloudflare
+(carpeta `panel/`) permite auto-actualizar el script, cambiar la lista de
+plugins y ver el estado en vivo.
 
 ## Uso rápido
 
@@ -32,6 +34,9 @@ python3 setup_mc.py
 |------|----------|
 | `--solo-notificar` | Deja servidor y túnel en segundo plano, avisa a Discord y sube a Git |
 | `--parar` | Cierra el túnel y para el servidor |
+| `--ui` | Solo la página local de control (localhost), sin tocar el servidor |
+| `--puerto-ui N` | Puerto de la UI local (8080) |
+| `--sin-ui` | No arrancar la UI local |
 | `--publicar "mensaje"` | Publica esta versión del script en el panel |
 | `--actualizar` | Aplica la última versión publicada en el panel y sale |
 | `--sin-actualizar` | No busca versiones nuevas al arrancar |
@@ -41,6 +46,28 @@ python3 setup_mc.py
 | `--tunel-diag` | Diagnóstico del túnel |
 
 `python3 setup_mc.py --help` lista todos.
+
+## UI local (localhost)
+
+Al ejecutar el script se levanta una página de control en
+`http://127.0.0.1:8080` (en Codespaces, la URL reenviada aparece en la pestaña
+**PORTS**; también puede verse con `python3 setup_mc.py --ui`):
+
+- **Estado en vivo**: servidor (PID, puerto, memoria y tiempo en pie), túnel
+  (dirección y proveedor), versiones y panel remoto.
+- **Consola completa**: la salida del servidor tal cual (con colores ANSI) y
+  envío de comandos al servidor (`list`, `save-all`, `op …`) con historial,
+  autocompletado y botones rápidos. Funciona por el mismo canal (FIFO) que
+  `echo 'op Jugador' > consola`.
+- **Acciones**: parar (servidor + túnel), arrancar (modo segundo plano),
+  respaldo ahora y prueba del webhook de Discord.
+- **Temas**: cada `.css` de `templates/` es un tema seleccionable; el de
+  defecto es `templates/template_default.css`.
+
+En modo desacoplado (`--solo-notificar`) la UI corre como proceso aparte y
+sobrevive a la salida del script; se apaga con su botón «apagar la ui». Solo
+escucha en `127.0.0.1` (nunca se expone sola a internet) y no requiere clave.
+El HTML y el JS están en `webui/` (archivos reales, sin nada embebido).
 
 ## Panel (opcional)
 
@@ -85,6 +112,10 @@ a la API. El despliegue del Worker está paso a paso en `panel/README.md`.
 | `estado` | Modo desacoplado (`--solo-notificar`) |
 | `respaldo` | Respaldos del mundo, `subir_cambios` |
 | `panel` | Cliente del panel: auto-update, latidos, plugins, `--publicar` |
+| `webui` | Página local de control: API, consola por FIFO, acciones, temas |
+
+Fuera del paquete: `webui/` (HTML/JS de la página local) y `templates/`
+(temas CSS; `template_default` es el de por defecto).
 
 ## Seguridad
 

@@ -1,9 +1,9 @@
 """Arranque y consola del servidor Minecraft."""
 
 import queue, select, subprocess, sys, threading, time
-from .config import PID_SERVIDOR, SERVER_DIR, SERVER_JAR, TIMEOUT_ARRANQUE
+from .config import LOG_SERVIDOR, PID_SERVIDOR, SERVER_DIR, SERVER_JAR, TIMEOUT_ARRANQUE
 from .ui import Barra, aviso, limpiar_linea, log
-from .procesos import _bombeo_salida, _drenar, _lanzar_puente_consola, args_sin_backup_auto, puerto_abierto
+from .procesos import _abrir_log, _bombeo_salida, _drenar, _lanzar_puente_consola, args_sin_backup_auto, puerto_abierto
 from .respaldo import BACKUP_AUTO_MANTENER, BACKUP_AUTO_MINUTOS, arrancar_backups_auto
 
 MEMORIA_INICIAL = "1G"
@@ -31,7 +31,11 @@ def arrancar_servidor(puerto: int):
     except FileNotFoundError:
         raise RuntimeError("No se encontró 'java' en el PATH.")
     cola: queue.Queue = queue.Queue()
-    threading.Thread(target=_bombeo_salida, args=(proc, cola), daemon=True).start()
+    # La salida va a la vez a la terminal (cola) y a logs/servidor.log, que es
+    # lo que lee la consola de la UI local. Se trunca en cada arranque para no
+    # mezclar la sesión anterior.
+    mango = _abrir_log(LOG_SERVIDOR, truncar=True)
+    threading.Thread(target=_bombeo_salida, args=(proc, cola, mango), daemon=True).start()
     PID_SERVIDOR.write_text(f"{proc.pid}\n")
     # El puente del FIFO y el hilo de respaldos automáticos hacen falta aquí
     # también: este es el camino normal (servidor ya existente), no solo el de

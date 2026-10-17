@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>setup2 · panel local</title>
+<link rel="stylesheet" id="hoja-tema" href="/tema/template_default.css">
+</head>
+<body>
+
+<header class="cabecera">
+  <div class="marca">setup<span class="dos">2</span> <span class="sep">·</span> panel local</div>
+  <div class="cabecera-derecha">
+    <span id="indicador" class="indicador muerto"></span>
+    <span id="indicador-texto" class="indicador-texto">conectando…</span>
+    <label class="tema">tema
+      <select id="selector-tema"></select>
+    </label>
+  </div>
+</header>
+
+<main class="rejilla">
+
+  <section class="panel" id="panel-estado">
+    <h2>estado</h2>
+    <div id="estado-filas" class="filas"><p class="tenue">cargando…</p></div>
+  </section>
+
+  <section class="panel" id="panel-acciones">
+    <h2>acciones</h2>
+    <div class="botones">
+      <button id="btn-arrancar">arrancar servidor</button>
+      <button id="btn-parar" class="critico">parar servidor + túnel</button>
+      <button id="btn-respaldo">respaldo ahora</button>
+      <button id="btn-webhook">probar webhook</button>
+      <button id="btn-apagar" class="discreto">apagar la ui</button>
+    </div>
+    <p id="aviso-accion" class="aviso"></p>
+  </section>
+
+  <section class="panel consola" id="panel-consola">
+    <h2>consola del servidor <span id="consola-nota" class="tenue"></span></h2>
+    <div class="consola-barra">
+      <label class="chico"><input type="checkbox" id="auto-scroll" checked> auto-scroll</label>
+      <button id="btn-limpiar" class="mini">limpiar</button>
+      <button id="btn-final" class="mini">ir al final</button>
+    </div>
+    <div id="consola" class="consola-caja" aria-live="polite"></div>
+    <div class="entrada">
+      <span class="prompt">&gt;</span>
+      <input id="comando" list="comandos" autocomplete="off" spellcheck="false"
+             placeholder="list · save-all · say hola · op TuNombre …">
+      <button id="btn-enviar">enviar</button>
+    </div>
+    <div class="rapidos">
+      <span class="tenue chico">rápidos:</span>
+      <button class="mini" data-cmd="list">list</button>
+      <button class="mini" data-cmd="save-all">save-all</button>
+      <button class="mini" data-cmd="save-all flush">save-all flush</button>
+      <button class="mini" data-cmd="tps">tps</button>
+      <button class="mini" data-cmd="whitelist list">whitelist list</button>
+      <button class="mini" data-cmd="stop" data-confirmar="¿Parar el servidor desde la consola? (equivale a cerrarlo sin tocar el túnel)">stop</button>
+    </div>
+    <datalist id="comandos">
+      <option value="list"></option>
+      <option value="stop"></option>
+      <option value="save-all"></option>
+      <option value="save-all flush"></option>
+      <option value="save-off"></option>
+      <option value="save-on"></option>
+      <option value="tps"></option>
+      <option value="reload confirm"></option>
+      <option value="say "></option>
+      <option value="op "></option>
+      <option value="deop "></option>
+      <option value="kick "></option>
+      <option value="ban "></option>
+      <option value="pardon "></option>
+      <option value="whitelist on"></option>
+      <option value="whitelist off"></option>
+      <option value="whitelist list"></option>
+      <option value="whitelist add "></option>
+      <option value="whitelist remove "></option>
+      <option value="gamemode survival "></option>
+      <option value="gamemode creative "></option>
+      <option value="time set day"></option>
+      <option value="time set night"></option>
+      <option value="weather clear"></option>
+      <option value="difficulty normal"></option>
+      <option value="give "></option>
+      <option value="tp "></option>
+    </datalist>
+  </section>
+
+</main>
+
+<footer class="pie">
+  consola: <code>logs/servidor.log</code> · comandos: <code>consola</code> (fifo) ·
+  html/js: <code>webui/</code> · temas: <code>templates/</code>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

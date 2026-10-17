@@ -24,19 +24,33 @@ while True:
 
 import os, queue, signal, socket, stat, subprocess, sys, time
 from pathlib import Path
-from .config import FIFO_CONSOLA, LOGS_DIR
-from .ui import _sin_ansi, aviso, limpiar_linea
+from .config import FIFO_CONSOLA, LOGS_DIR, PID_SERVIDOR, PID_TUNEL
+from .ui import _sin_ansi, aviso, limpiar_linea, log, ok, titulo
 
 # ─── 4. Primera ejecución para generar carpeta plugins ────────────────────
-def _bombeo_salida(proc, cola: queue.Queue):
-    """Lee la salida del proceso línea a línea sin bloquear el hilo principal."""
+def _bombeo_salida(proc, cola: queue.Queue, log_archivo=None):
+    """Lee la salida del proceso línea a línea sin bloquear el hilo principal.
+
+    Si se pasa `log_archivo`, cada línea se anexa también ahí: así la consola
+    web (webui) puede seguir la misma salida que ves en la terminal.
+    """
     try:
         if proc.stdout:
             for linea in iter(proc.stdout.readline, ""):
+                if log_archivo is not None:
+                    try:
+                        log_archivo.write(linea)
+                    except (OSError, ValueError):
+                        pass
                 cola.put(linea)
     except (ValueError, OSError):
         pass
     finally:
+        if log_archivo is not None:
+            try:
+                log_archivo.close()
+            except (OSError, ValueError):
+                pass
         cola.put(None)
 
 def _drenar(cola: queue.Queue, destino=None) -> list:
@@ -244,3 +258,31 @@ def _lanzar_puente_consola(proc) -> bool:
     except OSError as e:
         aviso(f"No se pudo abrir el canal de comandos: {e}")
         return False
+
+
+def parar_todo() -> int:
+    """Cierra el túnel y para el servidor usando el grupo de procesos.
+
+    Sin esto no había forma fiable de pararlos: `kill $(cat tunel.pid)` mata
+    al envoltorio npm y deja vivo el proceso node de Asyx. Lo usan --parar y
+    el botón "parar" de la UI local.
+    """
+    titulo("PARANDO TÚNEL Y SERVIDOR")
+    pid = _leer_pid(PID_TUNEL)
+    if pid and _vivo(pid):
+        log(f"Cerrando túnel (PID {pid})...")
+        _matar_pid(pid, espera=10)
+        ok("Túnel cerrado.")
+    else:
+        log("No hay túnel activo.")
+    _limpiar_pid(PID_TUNEL)
+
+    pid = _leer_pid(PID_SERVIDOR)
+    if pid and _vivo(pid):
+        log(f"Parando servidor (PID {pid}); Minecraft guarda el mundo...")
+        _matar_pid(pid, espera=60)
+        ok("Servidor parado.")
+    else:
+        log("No hay servidor activo.")
+    _limpiar_pid(PID_SERVIDOR)
+    return 0

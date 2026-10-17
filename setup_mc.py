@@ -28,6 +28,13 @@ Modos:
                                        restaura el mundo desde un .tar.zst
   python3 setup_mc.py --publicar "msg" publica esta versión del script en el panel
   python3 setup_mc.py --actualizar     aplica la última versión publicada y sale
+  python3 setup_mc.py --ui             solo la página local de control (localhost)
+
+UI local (localhost): al ejecutar el script se levanta una página de control en
+http://127.0.0.1:8080 (--puerto-ui, --sin-ui para desactivarla) con el estado
+del servidor, la consola (colores incluidos, comandos por el FIFO) y acciones
+(parar, arrancar, respaldar, probar webhook). El HTML/JS vive en webui/ y los
+temas (CSS) en templates/ (p. ej. templates/template_default.css).
 
 Panel (opcional, ver panel/README.md): con PANEL_URL y PANEL_API_KEY en .env
 el script se auto-actualiza al arrancar (--sin-actualizar lo desactiva),
@@ -48,14 +55,15 @@ from setup_mc import config
 from setup_mc import mcserver
 from setup_mc import panel
 from setup_mc import tuneles
+from setup_mc import webui
 from setup_mc.avisos import enviar_a_discord, notificar_apagado, notificar_servidor, obtener_webhook
-from setup_mc.config import PID_SERVIDOR, PID_TUNEL, PUERTO_MC, SERVER_DIR, SERVER_JAR
+from setup_mc.config import PUERTO_MC, SERVER_DIR, SERVER_JAR
 from setup_mc.estado import modo_notificacion
 from setup_mc.gitops import configurar_gitignore, exigir_env_protegido
 from setup_mc.jars import configurar_authme, instalar_plugins, version_skinsrestorer
 from setup_mc.mcserver import arrancar_servidor, esperar_puerto, seguir_servidor
 from setup_mc.paper import aceptar_eula, comprobar_java, descargar_paper, generar_plugins_dir, servidor_existe
-from setup_mc.procesos import _detener_proceso, _leer_pid, _limpiar_pid, _matar_pid, _vivo
+from setup_mc.procesos import _detener_proceso, parar_todo
 from setup_mc.respaldo import importar_respaldo, preguntar_crear_o_importar, preguntar_url_respaldo, subir_cambios
 from setup_mc.tuneles import NotificadorTunel, PROVEEDORES, abrir_tunel, asyx_esta_alto, asyx_registrar, detener_tunel, diagnostico_tunel
 from setup_mc.ui import aviso, error, log, ok, titulo
@@ -123,6 +131,12 @@ def parse_args():
                    help="Busca y aplica la última versión del panel, y sale")
     p.add_argument("--publicar", metavar="MENSAJE", default=None,
                    help="Publica esta versión del script en el panel y sale")
+    p.add_argument("--ui", action="store_true",
+                   help="Solo la página local de control (localhost), sin tocar el servidor")
+    p.add_argument("--puerto-ui", type=int, default=8080,
+                   help="Puerto de la UI local (8080)")
+    p.add_argument("--sin-ui", action="store_true",
+                   help="No arrancar la UI local")
     p.add_argument("--rama", default="main", help="Rama a la que se empuja (main)")
     return p.parse_args()
 
@@ -170,37 +184,12 @@ def preparar_servidor(args) -> bool:
     return True
 
 
-def parar_todo() -> int:
-    """Cierra el túnel y para el servidor usando el grupo de procesos.
-
-    Sin esto no había forma fiable de pararlos: `kill $(cat tunel.pid)` mata
-    al envoltorio npm y deja vivo el proceso node de Asyx.
-    """
-    titulo("PARANDO TÚNEL Y SERVIDOR")
-    pid = _leer_pid(PID_TUNEL)
-    if pid and _vivo(pid):
-        log(f"Cerrando túnel (PID {pid})...")
-        _matar_pid(pid, espera=10)
-        ok("Túnel cerrado.")
-    else:
-        log("No hay túnel activo.")
-    _limpiar_pid(PID_TUNEL)
-
-    pid = _leer_pid(PID_SERVIDOR)
-    if pid and _vivo(pid):
-        log(f"Parando servidor (PID {pid}); Minecraft guarda el mundo...")
-        _matar_pid(pid, espera=60)
-        ok("Servidor parado.")
-    else:
-        log("No hay servidor activo.")
-    _limpiar_pid(PID_SERVIDOR)
-    return 0
-
-
 def main():
     args = parse_args()
     if args.parar:
         return parar_todo()
+    if args.ui:
+        return webui.servir_foreground(args.puerto_ui)
     mcserver.MEMORIA_MAXIMA = args.memoria
     if mcserver.MEMORIA_INICIAL.endswith("G") and args.memoria.endswith("G"):
         mcserver.MEMORIA_INICIAL = f"{max(1, int(args.memoria[:-1]) // 2)}G"
@@ -254,6 +243,13 @@ def main():
             "✅ **Prueba de webhook**\n"
             "El script se está comunicando bien con Discord. "
             "Cuando arranque el servidor aquí irá la IP del túnel.")) else 1
+
+    # 0e. UI local: página de control (estado, consola, acciones y temas)
+    puerto_ui = None
+    if not args.sin_ui:
+        puerto_ui = webui.lanzar_desacoplado(args.puerto_ui)
+        if puerto_ui:
+            log(f"UI local: {webui.url_local(puerto_ui)}")
 
     # 1. Servidor
     if not preparar_servidor(args):
@@ -330,6 +326,11 @@ def main():
             print(f"  Servicio     : {PROVEEDORES[proveedor_usado]['nombre']}")
         if panel.hay_panel():
             print(f"  Panel        : {panel.config_panel()[0]}  (estado y actualizaciones)")
+        if puerto_ui:
+            print(f"  UI local     : {webui.url_local(puerto_ui)}")
+            reenviada = webui.url_codespaces(puerto_ui)
+            if reenviada:
+                print(f"  UI reenviada : {reenviada}  (pestaña PORTS)")
         print(f"  Versiones    : {rango_versiones()}  (ViaVersion + ViaBackwards)")
         print(f"  Skins        : SkinsRestorer {version_skinsrestorer()}  (se actualiza al correr)")
         print("  Login        : AuthMe  (regístrate la primera vez, luego /login)")
@@ -366,10 +367,6 @@ def main():
         else:
             aviso("El setup no llegó a completarse: no se sube nada a Git para no dejar basura.")
     return codigo
-
-
-if __name__ == "__main__":
-    sys.exit(main())
 
 
 if __name__ == "__main__":

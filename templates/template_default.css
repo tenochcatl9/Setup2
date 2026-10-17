@@ -1,0 +1,255 @@
+/* ==========================================================================
+   template_default — tema por defecto de la UI local de setup2
+   oscuro · paleta rojo y negro · Times New Roman · esquinas rectas
+   (copia este archivo para crear otro tema: cualquier *.css en templates/
+   aparece solo en el selector de la página)
+   ========================================================================== */
+
+:root {
+  --fondo: #070202;
+  --fondo-caja: #030000;
+  --panel: #100404;
+  --panel-alto: #170606;
+  --rojo: #a80f0f;
+  --rojo-vivo: #ff2626;
+  --rojo-oscuro: #4a0d0d;
+  --borde: #3a0c0c;
+  --texto: #eadcdc;
+  --texto-tenue: #9c7272;
+  --ambar: #e0a030;
+}
+
+/* esquinas rectas de verdad: nada de border-radius en ningún sitio */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border-radius: 0 !important;
+}
+
+html, body { height: 100%; }
+
+body {
+  background: var(--fondo);
+  color: var(--texto);
+  font-family: "Times New Roman", Times, "Liberation Serif", Georgia, serif;
+  font-size: 17px;
+  line-height: 1.45;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── cabecera ─────────────────────────────────────────────────────────── */
+.cabecera {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 2px solid var(--rojo);
+}
+
+.marca { font-size: 21px; letter-spacing: 1px; }
+.marca .dos { color: var(--rojo-vivo); }
+.marca .sep { color: var(--texto-tenue); }
+
+.cabecera-derecha { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+
+.indicador {
+  width: 13px;
+  height: 13px;
+  display: inline-block;
+  border: 1px solid var(--rojo-oscuro);
+  background: #333;
+}
+.indicador.vivo { background: var(--rojo-vivo); box-shadow: 0 0 10px var(--rojo-vivo); }
+.indicador.muerto { background: #3a3a3a; }
+
+.indicador-texto { font-size: 15px; letter-spacing: 1px; }
+
+.tema { color: var(--texto-tenue); font-size: 15px; }
+.tema select {
+  background: var(--fondo-caja);
+  color: var(--texto);
+  border: 1px solid var(--borde);
+  font-family: inherit;
+  font-size: 15px;
+  padding: 3px 6px;
+}
+
+/* ── rejilla principal ────────────────────────────────────────────────── */
+.rejilla {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+  grid-template-columns: 360px minmax(0, 1fr);
+  grid-template-areas:
+    "estado   consola"
+    "acciones consola";
+  align-items: start;
+  width: 100%;
+  max-width: 1500px;
+  margin: 0 auto;
+}
+
+#panel-estado { grid-area: estado; }
+#panel-acciones { grid-area: acciones; }
+#panel-consola { grid-area: consola; display: flex; flex-direction: column; }
+
+@media (max-width: 950px) {
+  .rejilla {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "estado" "acciones" "consola";
+  }
+}
+
+/* ── paneles ──────────────────────────────────────────────────────────── */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--borde);
+  padding: 12px 14px;
+}
+
+.panel h2 {
+  font-size: 15px;
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: 3px;
+  color: var(--rojo-vivo);
+  border-bottom: 1px solid var(--borde);
+  padding-bottom: 6px;
+  margin-bottom: 10px;
+}
+
+.tenue { color: var(--texto-tenue); }
+.chico { font-size: 14px; }
+
+/* estado: filas etiqueta/valor */
+.filas .fila {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+  border-bottom: 1px dotted var(--rojo-oscuro);
+}
+.filas .fila:last-child { border-bottom: 0; }
+.fila .etiqueta { color: var(--texto-tenue); }
+.fila .valor { text-align: right; word-break: break-all; }
+.fila a { color: var(--rojo-vivo); }
+
+/* ── botones ──────────────────────────────────────────────────────────── */
+.botones { display: flex; flex-direction: column; gap: 8px; }
+
+button {
+  background: var(--panel-alto);
+  color: var(--texto);
+  border: 1px solid var(--rojo);
+  font-family: inherit;
+  font-size: 16px;
+  padding: 8px 12px;
+  cursor: pointer;
+  letter-spacing: 0.5px;
+}
+button:hover:not(:disabled) { background: var(--rojo); color: #000; }
+button:disabled { opacity: 0.35; cursor: not-allowed; }
+
+button.critico { border-color: var(--rojo-vivo); color: var(--rojo-vivo); }
+button.critico:hover:not(:disabled) { background: var(--rojo-vivo); color: #000; }
+
+button.discreto { border-color: var(--borde); color: var(--texto-tenue); }
+
+button.mini {
+  font-size: 14px;
+  padding: 3px 9px;
+  background: var(--fondo-caja);
+}
+
+.aviso { margin-top: 10px; min-height: 20px; color: var(--ambar); font-size: 15px; }
+
+/* ── consola ──────────────────────────────────────────────────────────── */
+.consola-barra {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.consola-barra .chico { display: flex; align-items: center; gap: 5px; }
+
+.consola-caja {
+  background: var(--fondo-caja);
+  border: 1px solid var(--borde);
+  padding: 8px 10px;
+  height: 52vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  font-size: 15.5px;
+  overflow-wrap: break-word;
+}
+
+.consola-caja .linea { white-space: pre-wrap; }
+.consola-caja .linea:nth-child(even) { background: #0a0303; }
+
+/* colores ANSI del servidor (renombrados a la paleta) */
+.br { font-weight: bold; }
+.a30 { color: #6e5a5a; }
+.a31 { color: #ff4646; }
+.a32 { color: #7fbf5f; }
+.a33 { color: #d9b23c; }
+.a34 { color: #6f86e8; }
+.a35 { color: #c46fc4; }
+.a36 { color: #55c2c2; }
+.a37 { color: #d9d2d2; }
+.a90 { color: #8d6a6a; }
+.a91 { color: #ff7070; }
+.a92 { color: #a4de86; }
+.a93 { color: #f0d06a; }
+.a94 { color: #9aabff; }
+.a95 { color: #e39ce3; }
+.a96 { color: #83e0e0; }
+.a97 { color: #ffffff; }
+
+.entrada {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.prompt {
+  color: var(--rojo-vivo);
+  font-size: 20px;
+  width: 20px;
+  text-align: center;
+}
+.entrada input {
+  flex: 1;
+  background: var(--fondo-caja);
+  color: var(--texto);
+  border: 1px solid var(--borde);
+  font-family: inherit;
+  font-size: 16px;
+  padding: 8px 10px;
+}
+.entrada input:focus { outline: 1px solid var(--rojo-vivo); }
+
+.rapidos {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+/* ── pie ──────────────────────────────────────────────────────────────── */
+.pie {
+  padding: 8px 16px 16px;
+  color: var(--texto-tenue);
+  font-size: 14px;
+  text-align: center;
+}
+.pie code {
+  color: var(--rojo-vivo);
+  font-family: inherit;
+  border-bottom: 1px dotted var(--rojo-oscuro);
+}
