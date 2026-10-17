@@ -29,9 +29,8 @@ npx wrangler deploy
 # → imprime la URL pública: https://setup-mc-panel.TU-SUBDOMINIO.workers.dev
 ```
 
-Para desarrollo local: copia `.dev.vars.example` a `.dev.vars`, crea el KV
-local con `npx wrangler kv namespace create ESTADO --local` y usa
-`npm run dev`.
+Para desarrollo local: copia `.dev.vars.example` a `.dev.vars` y usa
+`npm run dev`; el KV local y la clave son independientes de producción.
 
 ## Conectar el script (en la máquina del servidor)
 
