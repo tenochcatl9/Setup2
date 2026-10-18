@@ -148,8 +148,9 @@ def construir_sitio(destino: Path, version: str, changelog: str = "") -> dict:
     """Prepara en `destino` lo que se sube a Cloudflare Pages.
 
     Copia la landing de `pagina/`, la interfaz publicable en `ui/` (con su
-    índice sha256) y el script empaquetado en `script/` (con manifest.json).
-    Devuelve el manifest del script.
+    índice sha256) y el script en `script/`: `setup_mc.py` suelto (se completa
+    solo al ejecutarse), `setup_mc.tar.gz` y `manifest.json`. Devuelve el
+    manifest del script.
     """
     destino.mkdir(parents=True, exist_ok=True)
 
@@ -179,6 +180,7 @@ def construir_sitio(destino: Path, version: str, changelog: str = "") -> dict:
     paquete = panel._empaquetar_script()
     (destino / "script").mkdir(parents=True, exist_ok=True)
     (destino / "script" / "setup_mc.tar.gz").write_bytes(paquete)
+    shutil.copy2(BASE_DIR / "setup_mc.py", destino / "script" / "setup_mc.py")
     manifest = {
         "version": version,
         "sha256": hashlib.sha256(paquete).hexdigest(),

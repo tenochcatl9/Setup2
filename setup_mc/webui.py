@@ -362,6 +362,9 @@ def _salud(puerto: int, timeout: float = 0.6) -> bool:
 def _puerto_libre(preferido: int, intentos: int = 30):
     for puerto in range(preferido, preferido + intentos):
         with socket.socket() as s:
+            # Igual que el servidor (allow_reuse_address): un TIME_WAIT
+            # reciente no debería mandarnos a un puerto más alto sin motivo.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind(("127.0.0.1", puerto))
                 return puerto

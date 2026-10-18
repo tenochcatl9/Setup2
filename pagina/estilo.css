@@ -138,6 +138,9 @@ pre code { color: inherit; }
 
 .boton:hover { background: var(--rojo-vivo); }
 
+.boton.secundario { background: transparent; color: var(--rojo-vivo); }
+.boton.secundario:hover { background: var(--panel-alto); }
+
 .datos { color: var(--texto-tenue); }
 
 .detalles summary { cursor: pointer; color: var(--texto-tenue); }

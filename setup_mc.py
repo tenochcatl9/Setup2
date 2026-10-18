@@ -46,8 +46,9 @@ baja al arrancar (sha256 por archivo) para su versión de localhost.
 Página pública (Cloudflare Pages, https://tenohost.pages.dev por defecto):
 guía de uso y descarga del script (pagina/ + script/ + ui/). De aquí baja el
 script la interfaz (html/js/css) al arrancar, y también las versiones nuevas
-de sí mismo. Se controla con PAGINA_URL (o PAGINA_URL=no) y PAGES_PROYECTO
-en .env; --publicar la construye y la despliega con wrangler.
+de sí mismo; setup_mc.py se ofrece suelto y, si el paquete setup_mc/ no está
+a su lado, lo descarga solo antes de nada. Se controla con PAGINA_URL (o
+PAGINA_URL=no) y PAGES_PROYECTO en .env; --publicar la construye y despliega.
 
 Antes de subir cambios a la rama principal se comprime el servidor en
 respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con
@@ -60,6 +61,87 @@ responde, el script cae automáticamente a Pinggy (solo ssh, sin cuenta).
 """
 
 import argparse, signal, sys
+
+
+# ─── Autoinstalación (un solo archivo) ───────────────────────────────────
+# setup_mc.py funciona también suelto: si el paquete setup_mc/ no está al
+# lado (p. ej. se bajó solo este archivo de la página), aquí se baja el
+# script completo antes de importarlo. En el repo no hace nada.
+_PAGINA_POR_DEFECTO = "https://tenohost.pages.dev"   # = pagina.URL_POR_DEFECTO
+
+
+def _miembro_del_script(nombre: str) -> bool:
+    partes = nombre.split("/")
+    if partes == ["setup_mc.py"]:
+        return True
+    return (len(partes) == 2 and partes[0] == "setup_mc"
+            and partes[1].endswith(".py"))
+
+
+def _descargar(url: str, timeout: int) -> bytes:
+    """Descarga con urllib y User-Agent propio (Cloudflare bloquea el de urllib)."""
+    import urllib.request
+    peticion = urllib.request.Request(url, headers={"User-Agent": "setup-mc-instalador"})
+    with urllib.request.urlopen(peticion, timeout=timeout) as r:
+        return r.read()
+
+
+def _cargar_paquete_si_falta() -> None:
+    """Completa la instalación bajando de la página el resto del script."""
+    import hashlib, json, os, tarfile, tempfile
+    from pathlib import Path
+
+    aqui = Path(__file__).resolve().parent
+    if (aqui / "setup_mc" / "config.py").is_file():
+        return
+    base = ""
+    try:
+        for linea in (aqui / ".env").read_text().splitlines():
+            linea = linea.strip()
+            if linea.startswith("PAGINA_URL="):
+                base = linea.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    except OSError:
+        pass
+    if base.lower() in ("", "no", "off", "ninguna"):
+        base = _PAGINA_POR_DEFECTO
+    base = base.rstrip("/")
+    tar_url = f"{base}/script/setup_mc.tar.gz"
+    print(f"[*] Falta el paquete setup_mc/: bajando el script completo de {base} ...")
+    try:
+        datos = _descargar(tar_url, 60)
+    except OSError as exc:
+        raise SystemExit(
+            f"    No se pudo bajar {tar_url} ({exc}).\n"
+            "    Revisa la conexión o descarga setup_mc.tar.gz y descomprímelo aquí.")
+    try:
+        esperado = str(json.loads(_descargar(f"{base}/script/manifest.json", 15)).get("sha256") or "")
+    except (OSError, ValueError):
+        esperado = ""
+    real = hashlib.sha256(datos).hexdigest()
+    if esperado and esperado != real:
+        raise SystemExit("    El paquete no coincide con su sha256; no se instala nada.")
+    if not esperado:
+        print("[~] No se pudo verificar el sha256 (manifest no disponible).")
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as f:
+        f.write(datos)
+        temporal = f.name
+    try:
+        with tarfile.open(temporal, "r:gz") as tar:
+            for miembro in tar.getmembers():
+                if miembro.isfile() and _miembro_del_script(miembro.name):
+                    try:
+                        tar.extract(miembro, aqui, filter="data")
+                    except TypeError:          # Python < 3.12
+                        tar.extract(miembro, aqui)
+    finally:
+        os.unlink(temporal)
+    print("[+] Script completo instalado; sigue la ejecución normal.")
+
+
+_cargar_paquete_si_falta()
+
+
 from setup_mc import config
 from setup_mc import mcserver
 from setup_mc import pagina

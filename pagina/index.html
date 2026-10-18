@@ -33,14 +33,14 @@
   <h2>Cómo usarlo</h2>
   <ol class="pasos">
     <li>
-      <span class="titulo">1. Descarga el script</span>
-      <pre><code>curl -fsSLO https://tenohost.pages.dev/script/setup_mc.tar.gz
-mkdir mi-servidor &amp;&amp; tar xzf setup_mc.tar.gz -C mi-servidor &amp;&amp; cd mi-servidor</code></pre>
+      <span class="titulo">1. Descarga el instalador (un solo archivo)</span>
+      <pre><code>curl -fsSLO https://tenohost.pages.dev/script/setup_mc.py</code></pre>
+      <p class="nota">¿Prefieres el código completo a la vista? Al final de la página tienes también el paquete en tar.gz.</p>
     </li>
     <li>
       <span class="titulo">2. Arranca</span>
       <pre><code>python3 setup_mc.py</code></pre>
-      <p class="nota">La primera vez el script baja de esta misma página la interfaz y los temas, y comprueba que tienes Python 3 y Java 21+.</p>
+      <p class="nota">La primera vez se descarga solo el resto del script, y después la interfaz y los temas, desde esta misma página; además comprueba que tengas Python 3 y Java 21+.</p>
     </li>
     <li>
       <span class="titulo">3. Juega</span>
@@ -53,9 +53,11 @@ mkdir mi-servidor &amp;&amp; tar xzf setup_mc.tar.gz -C mi-servidor &amp;&amp; c
 <section class="bloque" id="descargas">
   <h2>Descargas</h2>
   <div class="descarga">
-    <a class="boton" href="script/setup_mc.tar.gz" download>Descargar setup2 (tar.gz)</a>
+    <a class="boton" href="script/setup_mc.py" download>Descargar setup_mc.py</a>
+    <a class="boton secundario" href="script/setup_mc.tar.gz" download>Paquete completo (tar.gz)</a>
     <span class="datos" id="datos-version">comprobando versión…</span>
   </div>
+  <p class="nota">Un solo <code>.py</code>: al ejecutarlo se baja el resto del script. El <code>.tar.gz</code> trae todo el código suelto, para verlo o guardarlo.</p>
   <details class="detalles">
     <summary>Comprobación de integridad (sha256)</summary>
     <pre id="sha256" class="sha">—</pre>

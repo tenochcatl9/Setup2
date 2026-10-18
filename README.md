@@ -86,8 +86,9 @@ En `pagina/` vive la página de presentación (guía de uso y descarga del
 script, nada del panel) que se publica en Cloudflare Pages, por defecto
 `https://tenohost.pages.dev`. Junto a ella se publican dos bloques:
 
-- `script/` — el script en `setup_mc.tar.gz` y un `manifest.json` con versión,
-  sha256 y changelog. Es la descarga que ofrece la página.
+- `script/` — `setup_mc.py` suelto (un solo archivo: si el paquete no está a
+  su lado, se lo baja solo al ejecutarse), el paquete `setup_mc.tar.gz` y un
+  `manifest.json` con versión, sha256 y changelog.
 - `ui/` — la interfaz local (`index.html`, `app.js`, `templates/*.css`) y un
   `indice.json` con rutas y sha256.
 
