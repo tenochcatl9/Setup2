@@ -52,8 +52,10 @@ PAGINA_URL=no) y PAGES_PROYECTO en .env; --publicar la construye y despliega.
 
 Antes de subir cambios a la rama principal se comprime el servidor en
 respaldo/servidor-mc.tar.zst (mundo + plugins + server.jar + manifiesto con
-sha256). Ese archivo SÍ se versiona a propósito: es lo que permite importar
-el mundo en otra máquina.
+sha256), que es lo que permite importar el mundo en otra máquina. La
+instalación (plugins y configuración) va aparte, en
+respaldo/instalacion.tar.zst, con este mismo setup_mc.py dentro: se regenera
+solo cuando el script cambia.
 
 Túnel: Asyx en modo TCP, que además publica un registro SRV para que el
 cliente de Minecraft entre solo con el hostname. Si no está dado de alta o no

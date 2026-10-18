@@ -25,8 +25,8 @@ python3 setup_mc.py
   panel sin tocar el código.
 - **Túnel público**: Asyx con Pinggy de respaldo; barra de progreso y avisos a
   Discord, incluida la dirección final.
-- **Respaldos**: comprime el mundo y lo sube a Git; respaldos automáticos
-  mientras el servidor corre.
+- **Respaldos**: comprime el mundo y la instalación (con `setup_mc.py` dentro)
+  y los sube a Git; respaldos automáticos mientras el servidor corre.
 - **Panel (opcional)**: auto-actualización del propio script, estado en vivo y
   publicación de versiones.
 - **Página pública (opcional)**: guía y descarga del script en Cloudflare
@@ -153,7 +153,7 @@ a la API. El despliegue del Worker está paso a paso en `panel/README.md`.
 | `avisos` | Discord: webhook, notificaciones |
 | `tuneles` | Asyx y Pinggy, notificador de progreso |
 | `estado` | Modo desacoplado (`--solo-notificar`) |
-| `respaldo` | Respaldos del mundo, `subir_cambios` |
+| `respaldo` | Respaldos del mundo y de la instalación (lleva el script dentro), `subir_cambios` |
 | `panel` | Cliente del panel: auto-update (script e interfaz), latidos, plugins, `--publicar` |
 | `pagina` | Página pública (Pages): construir/desplegar y bajadas estáticas (interfaz y script) |
 | `webui` | Página local de control: API, consola por FIFO, acciones, temas |

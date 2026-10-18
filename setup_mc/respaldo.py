@@ -12,11 +12,14 @@ from .avisos import enviar_a_discord, obtener_webhook
 
 # ─── 13. Respaldo comprimido e importación ───────────────────────────────
 # Rutas que se empaquetan (relativas a SERVER_DIR); el resto se regenera al importar.
-# Lo que se versiona en git: plugins, configuración y datos de Paper. Entra en
-# ~20 MB, así que el repositorio lo aguanta siempre. El mundo, que ya no cabe,
-# va aparte a la release.
+# Lo que se versiona en git: plugins, configuración, datos de Paper y el propio
+# setup_mc.py (el .py suelto, que se completa solo). Entra en ~20 MB, así que el
+# repositorio lo aguanta siempre. El mundo, que ya no cabe, va aparte a la
+# release.
 BACKUP_INCLUYE_INSTALACION = ["plugins", "config", ".paper", "server.properties",
-                              "bukkit.yml", "spigot.yml", "eula.txt"]
+                              "bukkit.yml", "spigot.yml", "eula.txt", "setup_mc.py"]
+
+SCRIPT_SUELTO = SERVER_DIR / "setup_mc.py"   # el que también va en el respaldo
 
 BACKUP_INCLUYE = ["server.jar", "world", "plugins", "config", ".paper",
                   "server.properties", "eula.txt", "ops.json", "whitelist.json",
@@ -489,11 +492,13 @@ def _en_release(activo: bool) -> None:
         _git(["add", "-f", rel])
 
 def crear_respaldo_instalacion() -> bool:
-    """Empaqueta plugins + configuración (~20 MB) en respaldo/instalacion.tar.zst.
+    """Empaqueta plugins + configuración + el script (~20 MB) en respaldo/instalacion.tar.zst.
 
-    Este sí se versiona en git: el mundo ya no cabe (160 MB) y se va a una
-    release, pero el resto de la instalación del servidor cabe de sobra y así
-    queda en el repositorio, que es lo que se puede ver y recuperar.
+    Dentro va también setup_mc.py (el suelto, que se completa solo): así el
+    respaldo lleva siempre el script. Este sí se versiona en git: el mundo ya
+    no cabe (160 MB) y se va a una release, pero el resto de la instalación
+    del servidor cabe de sobra y así queda en el repositorio, que es lo que se
+    puede ver y recuperar.
     """
     destino = RESPALDO_DIR / "instalacion.tar.zst"
     incluir = [q for q in BACKUP_INCLUYE_INSTALACION
@@ -506,6 +511,7 @@ def crear_respaldo_instalacion() -> bool:
         "paper": _version_paper() or "desconocida",
         "minecraft": _version_mc_del_jar() or "desconocida",
         "solo_instalacion": True,
+        "script_sha256": _sha256_archivo(SCRIPT_SUELTO) if SCRIPT_SUELTO.is_file() else "",
         "contenido_sha256": hash_contenido,
         "archivos": archivos,
     }
@@ -519,8 +525,35 @@ def crear_respaldo_instalacion() -> bool:
         error("El respaldo de instalación no lleva manifiesto; se borra.")
         return False
     ok(f"Respaldo de instalación: {destino.stat().st_size / 1048576:,.0f} MB "
-       f"(plugins y configuración, se versiona en git)")
+       f"(plugins, configuración y el script; se versiona en git)")
     return True
+
+
+def _instalacion_al_dia() -> bool:
+    """¿El respaldo de instalación ya lleva dentro el setup_mc.py de ahora?
+
+    El manifiesto va primero en el tar, así que basta con descomprimir el
+    principio (no el paquete entero). Se usa para rehacer el respaldo cuando
+    el script cambia, aunque el mundo no haya cambiado.
+    """
+    destino = RESPALDO_DIR / "instalacion.tar.zst"
+    if not destino.is_file():
+        return False
+    actual = _sha256_archivo(SCRIPT_SUELTO) if SCRIPT_SUELTO.is_file() else ""
+    try:
+        con_tar = subprocess.Popen(_descompresor(destino), stdout=subprocess.PIPE)
+        try:
+            r = subprocess.run(["tar", "-xOf", "-", MANIFIESTO],
+                               stdin=con_tar.stdout, capture_output=True)
+        finally:
+            con_tar.stdout.close()
+            con_tar.wait()
+        if r.returncode != 0:
+            return False
+        guardado = str(json.loads(r.stdout).get("script_sha256") or "")
+    except (OSError, ValueError):
+        return False
+    return guardado == actual
 
 def _empaquetar(destino: Path, manifiesto: dict, incluir: list,
                 total_esperado: int | None = None) -> tuple:
@@ -599,6 +632,9 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
         if not RESPALDO_ACTUAL.is_file():
             aviso("Se regenerará en la próxima ejecución que cambie algo.")
             return False
+        if not _instalacion_al_dia():
+            log("El respaldo de instalación no lleva el script actual: se regenera.")
+            crear_respaldo_instalacion()
         return True
     manifiesto = {
         "creado": time.strftime("%Y-%m-%dT%H:%M:%S"),
