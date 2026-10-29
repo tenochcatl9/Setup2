@@ -1,6 +1,6 @@
 """Descarga y configuración de los plugins del servidor."""
 
-import hashlib, json, re, time
+import hashlib, io, json, os, re, tempfile, time, zipfile
 from pathlib import Path
 import requests
 from . import panel
@@ -18,6 +18,11 @@ PLUGIN_VIAVERSION = "ViaVersion.jar"
 PLUGIN_VIABACKWARDS = "ViaBackwards.jar"
 
 PLUGIN_SKINSRESTORER = "SkinsRestorer.jar"
+
+PLUGINS_PROPIOS = {
+    "permadeath": "Permadeath.jar",
+    "combat-basics": "CombatBasics.jar",
+}
 
 # SkinsRestorer se publica en Modrinth (no en el release de GitHub del proyecto).
 PROYECTO_SKINSRESTORER = "skinsrestorer"
@@ -271,3 +276,99 @@ def instalar_plugins(forzar: bool = False) -> None:
     version_skin = versiones.get(PLUGIN_SKINSRESTORER) or version_skinsrestorer()
     ok(f"Plugins listos: {rango_versiones()} vía ViaVersion/ViaBackwards, "
        f"login con AuthMe y SkinsRestorer {version_skin}.")
+
+
+def actualizar_plugins_propios() -> None:
+    """Actualiza los plugins propios instalados antes de arrancar Paper."""
+    from .pagina import pagina_config
+
+    url, _proyecto = pagina_config()
+    if not url.startswith("https://"):
+        aviso("No se revisaron las actualizaciones de plugins: la página no usa HTTPS.")
+        return
+    try:
+        respuesta = requests.get(
+            f"{url.rstrip('/')}/plugins/manifest.json",
+            headers={"User-Agent": "setup-mc-plugin-updater"},
+            timeout=15,
+        )
+        respuesta.raise_for_status()
+        manifest = respuesta.json()
+    except (requests.RequestException, ValueError) as exc:
+        aviso(f"No se pudieron consultar actualizaciones de plugins: {exc}")
+        return
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("plugins"), list):
+        aviso("No se pudieron consultar actualizaciones: el catálogo no es válido.")
+        return
+
+    disponibles = {
+        plugin.get("id"): plugin for plugin in manifest["plugins"]
+        if isinstance(plugin, dict) and plugin.get("id") in PLUGINS_PROPIOS
+    }
+    for plugin_id, nombre in PLUGINS_PROPIOS.items():
+        destino = PLUGINS_DIR / nombre
+        plugin = disponibles.get(plugin_id)
+        if plugin is None or not destino.is_file():
+            continue
+        digest = str(plugin.get("sha256") or "")
+        archivo = str(plugin.get("archivo") or "")
+        if (archivo != nombre or not re.fullmatch(r"[a-fA-F0-9]{64}", digest)):
+            aviso(f"Se omitió la actualización de {nombre}: catálogo inválido.")
+            continue
+        try:
+            with zipfile.ZipFile(destino) as instalado:
+                manifiestos = {"plugin.yml", "paper-plugin.yml"} & set(instalado.namelist())
+                version_instalada = ""
+                if manifiestos:
+                    texto = instalado.read(sorted(manifiestos)[0]).decode("utf-8")
+                    encontrada = re.search(r"(?m)^version:\s*['\"]?([^'\"\s]+)", texto)
+                    version_instalada = encontrada.group(1) if encontrada else ""
+            version_publicada = str(plugin.get("version") or "")
+            version_pattern = r"\d+(?:\.\d+)*"
+            if (not re.fullmatch(version_pattern, version_instalada)
+                    or not re.fullmatch(version_pattern, version_publicada)):
+                raise RuntimeError("no se pudo leer una versión semántica del plugin.")
+            actual_parts = tuple(map(int, version_instalada.split(".")))
+            nueva_parts = tuple(map(int, version_publicada.split(".")))
+            longitud = max(len(actual_parts), len(nueva_parts))
+            actual_parts += (0,) * (longitud - len(actual_parts))
+            nueva_parts += (0,) * (longitud - len(nueva_parts))
+            if nueva_parts < actual_parts:
+                log(f"{nombre} local v{version_instalada} es más reciente que el catálogo "
+                    f"v{version_publicada}; no se reemplaza.")
+                continue
+            actual = hashlib.sha256(destino.read_bytes()).hexdigest()
+            if actual.lower() == digest.lower():
+                continue
+            descarga = requests.get(
+                f"{url.rstrip('/')}/plugins/{nombre}",
+                headers={"User-Agent": "setup-mc-plugin-updater"},
+                timeout=60,
+            )
+            descarga.raise_for_status()
+            datos = descarga.content
+            if not datos or len(datos) > 100 * 1024 * 1024:
+                raise RuntimeError("el JAR está vacío o supera los 100 MB.")
+            if hashlib.sha256(datos).hexdigest().lower() != digest.lower():
+                raise RuntimeError("el SHA-256 no coincide con el catálogo.")
+            with zipfile.ZipFile(io.BytesIO(datos)) as jar:
+                if "plugin.yml" not in jar.namelist():
+                    raise RuntimeError("el JAR no contiene plugin.yml.")
+                descriptor = jar.read("plugin.yml").decode("utf-8")
+            if not re.search(
+                    rf"(?m)^version:\s*['\"]?{re.escape(version_publicada)}['\"]?\s*$",
+                    descriptor):
+                raise RuntimeError("la versión declarada no coincide con el catálogo.")
+            with tempfile.NamedTemporaryFile(
+                    dir=PLUGINS_DIR, prefix=".plugin-update-", suffix=".part",
+                    delete=False) as temporal:
+                temporal.write(datos)
+                temporal_path = Path(temporal.name)
+            try:
+                os.replace(temporal_path, destino)
+            finally:
+                temporal_path.unlink(missing_ok=True)
+            ok(f"{nombre} actualizado a v{version_publicada}; se cargará al arrancar Paper.")
+        except (OSError, requests.RequestException, RuntimeError,
+                zipfile.BadZipFile, UnicodeDecodeError) as exc:
+            aviso(f"No se pudo actualizar {nombre}; se conserva la versión instalada: {exc}")

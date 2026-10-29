@@ -158,12 +158,14 @@ from setup_mc.avisos import enviar_a_discord, notificar_apagado, notificar_servi
 from setup_mc.config import PUERTO_MC, SERVER_DIR, SERVER_JAR
 from setup_mc.estado import modo_notificacion
 from setup_mc.gitops import configurar_gitignore, exigir_env_protegido
-from setup_mc.jars import configurar_authme, instalar_plugins, version_skinsrestorer
+from setup_mc.jars import (
+    actualizar_plugins_propios, configurar_authme, instalar_plugins, version_skinsrestorer,
+)
 from setup_mc.mcserver import arrancar_servidor, esperar_puerto, seguir_servidor
 from setup_mc.paper import (aceptar_eula, actualizar_paper, avisar_si_hay_nueva,
                             comprobar_java, descargar_paper, generar_plugins_dir,
                             revertir_paper, servidor_existe)
-from setup_mc.procesos import _detener_proceso, parar_todo
+from setup_mc.procesos import _detener_proceso, parar_todo, puerto_abierto
 from setup_mc.respaldo import importar_respaldo, preguntar_crear_o_importar, preguntar_url_respaldo, subir_cambios
 from setup_mc.tuneles import NotificadorTunel, PROVEEDORES, abrir_tunel, asyx_esta_alto, asyx_registrar, detener_tunel, diagnostico_tunel
 from setup_mc.ui import aviso, error, log, ok, titulo
@@ -285,6 +287,10 @@ def preparar_servidor(args) -> bool:
     if nuevo:
         generar_plugins_dir()
     instalar_plugins(forzar=args.reinstalar_plugins)
+    if puerto_abierto(args.puerto):
+        log("El servidor ya está en marcha; los plugins se actualizarán antes del próximo arranque.")
+    else:
+        actualizar_plugins_propios()
     return True
 
 
