@@ -17,7 +17,7 @@ Endpoints:
   POST /api/accion     → parar | arrancar | respaldo | webhook | apagar_ui
 """
 
-import json, os, re, socket, subprocess, sys, threading, time, urllib.request
+import json, os, re, socket, struct, subprocess, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -29,6 +29,7 @@ from .config import (BASE_DIR, FIFO_CONSOLA, LOG_SERVIDOR, LOG_TUNEL, LOGS_DIR,
                      PID_SERVIDOR, PID_TUNEL, PUERTO_MC)
 from .jars import version_skinsrestorer
 from .panel import actualizar_ui, config_panel
+from .paper import estado_paper
 from .procesos import _leer_pid, _vivo, parar_todo, puerto_abierto
 from .respaldo import respaldo_automatico
 from .tuneles import PROVEEDORES
@@ -42,6 +43,8 @@ TEMA_POR_DEFECTO = "template_default"
 
 _lanzado = {"ts": 0.0}          # cuándo se pidió arrancar el servidor (anti doble clic)
 _candado_respaldo = threading.Lock()
+_candado_paper = threading.Lock()
+_ultima_actualizacion = {"ts": 0.0}   # anti doble clic del botón de Paper
 
 # ─── Datos para la página ─────────────────────────────────────────────────
 
@@ -66,6 +69,113 @@ def _puerto_servidor() -> int:
     except (OSError, ValueError):
         pass
     return PUERTO_MC
+
+# ─── Jugadores en vivo (Server List Ping) ─────────────────────────────────
+# Se pregunta al propio servidor por el protocolo de estado de Minecraft. Así
+# el contador es exacto y no hace falta RCON, consultar la consola ni escribir
+# nada en el log. enable-status=true es el valor por defecto de Paper.
+_CACHE_JUGADORES = {"ts": 0.0, "puerto": 0, "datos": None}
+_CANDADO_JUGADORES = threading.Lock()
+
+def _max_jugadores() -> int:
+    try:
+        for linea in (BASE_DIR / "server.properties").read_text(errors="replace").splitlines():
+            if linea.strip().startswith("max-players="):
+                return int(linea.split("=", 1)[1].strip())
+    except (OSError, ValueError):
+        pass
+    return 20
+
+def _varint(numero: int) -> bytes:
+    """Varint sin signo del protocolo de Minecraft."""
+    numero &= 0xFFFFFFFF
+    salida = bytearray()
+    while True:
+        byte = numero & 0x7F
+        numero >>= 7
+        if numero:
+            salida.append(byte | 0x80)
+        else:
+            salida.append(byte)
+            return bytes(salida)
+
+def _varint_de_bytes(datos: bytes, inicio: int = 0) -> tuple:
+    numero = 0
+    for i in range(5):
+        if inicio + i >= len(datos):
+            raise ValueError("varint incompleto")
+        byte = datos[inicio + i]
+        numero |= (byte & 0x7F) << (7 * i)
+        if not byte & 0x80:
+            return numero, inicio + i + 1
+    raise ValueError("varint demasiado largo")
+
+def _leer_varint(sock) -> int:
+    numero = 0
+    for i in range(5):
+        byte = sock.recv(1)
+        if not byte:
+            raise OSError("conexión cerrada")
+        valor = byte[0]
+        numero |= (valor & 0x7F) << (7 * i)
+        if not valor & 0x80:
+            return numero
+    raise OSError("varint demasiado largo")
+
+def _leer_paquete(sock) -> bytes:
+    largo = _leer_varint(sock)
+    if largo < 1 or largo > 2 * 1024 * 1024:
+        raise OSError("paquete de estado inválido")
+    datos = bytearray()
+    while len(datos) < largo:
+        trozo = sock.recv(largo - len(datos))
+        if not trozo:
+            raise OSError("conexión cerrada")
+        datos.extend(trozo)
+    return bytes(datos)
+
+def _ping_jugadores(puerto: int, timeout: float = 1.2) -> dict:
+    with socket.create_connection(("127.0.0.1", puerto), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        host = "127.0.0.1"
+        handshake = (b"\x00" + _varint(-1) + _varint(len(host))
+                     + host.encode("utf-8") + struct.pack(">H", puerto) + _varint(1))
+        sock.sendall(_varint(len(handshake)) + handshake)
+        sock.sendall(b"\x01\x00")           # status request
+        datos = _leer_paquete(sock)
+    if not datos or datos[0] != 0:
+        raise OSError("respuesta de estado inesperada")
+    largo, inicio = _varint_de_bytes(datos, 1)
+    texto = datos[inicio:inicio + largo].decode("utf-8", errors="replace")
+    status = json.loads(texto)
+    jugadores = status.get("players") or {}
+    muestra = jugadores.get("sample") or []
+    nombres = [str(p.get("name")) for p in muestra
+               if isinstance(p, dict) and p.get("name")]
+    return {
+        "en_linea": int(jugadores.get("online") or 0),
+        "max": int(jugadores.get("max") or _max_jugadores()),
+        "nombres": nombres,
+        "disponible": True,
+    }
+
+def estado_jugadores(puerto: int | None = None) -> dict:
+    """Jugadores conectados ahora, con caché corta para no repetir el ping."""
+    puerto = puerto or _puerto_servidor()
+    ahora = time.time()
+    with _CANDADO_JUGADORES:
+        datos = _CACHE_JUGADORES["datos"]
+        if (datos is not None and _CACHE_JUGADORES["puerto"] == puerto
+                and ahora - _CACHE_JUGADORES["ts"] < 3.0):
+            return datos
+    try:
+        datos = _ping_jugadores(puerto)
+    except (OSError, ValueError, json.JSONDecodeError):
+        datos = {"en_linea": 0, "max": _max_jugadores(), "nombres": [],
+                 "disponible": False}
+    with _CANDADO_JUGADORES:
+        _CACHE_JUGADORES.update(ts=ahora, puerto=puerto, datos=datos)
+    return datos
 
 def _uptime(pid) -> int | None:
     """Segundos que lleva vivo el proceso (leyendo /proc; none si no se puede)."""
@@ -128,6 +238,8 @@ def estado() -> dict:
             "xmx": _xmx(pid_srv) if propio else "",
         },
         "tunel": _tunel_info(),
+        "jugadores": estado_jugadores(puerto),
+        "paper": estado_paper(),
         "script": {
             "version": config.VERSION_SCRIPT,
             "mc": rango_versiones(),
@@ -205,7 +317,8 @@ def _accion_arrancar() -> tuple:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         mango = open(LOGS_DIR / "arranque-ui.log", "a", buffering=1)
         subprocess.Popen(
-            [sys.executable, str(BASE_DIR / "setup_mc.py"), "--solo-notificar"],
+            [sys.executable, str(BASE_DIR / "setup_mc.py"), "--solo-notificar",
+             "--sin-ui", "--sin-abrir-ui"],
             cwd=str(BASE_DIR), stdin=subprocess.DEVNULL, stdout=mango,
             stderr=subprocess.STDOUT, start_new_session=True,
         )
@@ -222,6 +335,33 @@ def _accion_respaldo() -> tuple:
             respaldo_automatico(_puerto_servidor())
     threading.Thread(target=_tarea, daemon=True).start()
     return True, "respaldo lanzado (sigue el progreso en la consola)"
+
+def _accion_actualizar_paper() -> tuple:
+    """Lanza la actualización de Paper en segundo plano (para el botón de la UI)."""
+    info = estado_paper()
+    if not info.get("hay_nueva"):
+        return False, "Paper ya está al día (o aún se está consultando la última versión)"
+    with _candado_paper:
+        ahora = time.time()
+        if ahora - _ultima_actualizacion["ts"] < 15 * 60:
+            return False, "ya hay una actualización en curso; sigue la consola"
+        _ultima_actualizacion["ts"] = ahora
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        # Se escribe en el mismo log que lee la consola: el usuario ve el
+        # respaldo, la descarga y el arranque desde la propia página.
+        mango = open(LOG_SERVIDOR, "a", buffering=1)
+        subprocess.Popen(
+            [sys.executable, str(BASE_DIR / "setup_mc.py"),
+             "--actualizar-paper", "--solo-notificar", "--sin-push",
+             "--sin-ui", "--sin-abrir-ui"],
+            cwd=str(BASE_DIR), stdin=subprocess.DEVNULL, stdout=mango,
+            stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    except OSError as e:
+        return False, f"no se pudo lanzar la actualización: {e}"
+    return True, (f"actualizando Paper {info.get('actual')} -> {info.get('ultima')}: "
+                  "se para el servidor, se respalda y vuelve a arrancar; sigue la consola")
 
 def _accion_webhook() -> tuple:
     webhook = obtener_webhook()
@@ -244,6 +384,9 @@ def ejecutar_accion(nombre: str, servidor=None) -> tuple:
         return (200 if ok_ else 409), {"ok": ok_, "detalle": detalle}
     if nombre == "webhook":
         ok_, detalle = _accion_webhook()
+        return (200 if ok_ else 409), {"ok": ok_, "detalle": detalle}
+    if nombre == "actualizar_paper":
+        ok_, detalle = _accion_actualizar_paper()
         return (200 if ok_ else 409), {"ok": ok_, "detalle": detalle}
     if nombre == "apagar_ui":
         if servidor is not None:
@@ -282,6 +425,24 @@ class _Manejador(BaseHTTPRequestHandler):
         except OSError:
             self._json({"error": f"falta {ruta.name} en {ruta.parent.name}/"}, 404)
 
+    def _descargar_log(self):
+        """Entrega el log completo como descarga, sin el límite de /api/consola."""
+        fuente = _fuente_consola()
+        try:
+            cuerpo = fuente.read_bytes()
+        except OSError:
+            return self._json({"error": "todavía no hay log de consola"}, 404)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.send_header("Content-Disposition", f'attachment; filename="{fuente.name}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(cuerpo)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _cuerpo_json(self) -> dict:
         try:
             largo = int(self.headers.get("Content-Length") or 0)
@@ -310,6 +471,8 @@ class _Manejador(BaseHTTPRequestHandler):
             return self._json({"temas": listar_temas(), "defecto": TEMA_POR_DEFECTO})
         if ruta == "/api/estado":
             return self._json(estado())
+        if ruta == "/api/consola/descargar":
+            return self._descargar_log()
         if ruta == "/api/consola":
             try:
                 desde = int((consulta.get("desde") or ["0"])[0])
@@ -378,6 +541,25 @@ def imprimir_urls(puerto: int) -> None:
     if reenviada:
         print(f"  UI reenviada  : {reenviada}  (pestaña PORTS)")
 
+def abrir_navegador(puerto: int) -> bool:
+    """Abre la UI en el navegador del usuario, sin romper nada si no hay uno.
+
+    En Codespaces se usa la URL reenviada (el helper $BROWSER ejecuta
+    `code --openExternal`); en local, 127.0.0.1. webbrowser.open puede devolver
+    False aunque el navegador se abra en segundo plano, así que el fallback es
+    solo informativo.
+    """
+    url = url_codespaces(puerto) or url_local(puerto)
+    try:
+        import webbrowser
+        if webbrowser.open(url, new=2):
+            log(f"UI abierta en el navegador: {url}")
+            return True
+    except Exception:  # navegador ausente, sin permisos, entorno headless...
+        pass
+    log(f"Abre la UI en el navegador: {url}")
+    return False
+
 def lanzar_desacoplado(puerto_preferido: int = PUERTO_UI_POR_DEFECTO):
     """Deja la UI escuchando en segundo plano y devuelve su puerto.
 
@@ -420,7 +602,8 @@ def _refresco_silencioso() -> None:
     except Exception:  # ni por la página
         pass
 
-def servir_foreground(puerto_preferido: int = PUERTO_UI_POR_DEFECTO) -> int:
+def servir_foreground(puerto_preferido: int = PUERTO_UI_POR_DEFECTO,
+                      abrir: bool = False) -> int:
     """Modo `--ui`: sirve la página en primer plano hasta Ctrl+C."""
     puerto = _puerto_libre(puerto_preferido)
     if puerto is None:
@@ -442,6 +625,8 @@ def servir_foreground(puerto_preferido: int = PUERTO_UI_POR_DEFECTO) -> int:
     print("  Ctrl+C aquí apaga solo la UI; el servidor no se toca.")
     print("=" * 62)
     print()
+    if abrir:
+        abrir_navegador(puerto)
     try:
         servidor.serve_forever()
     except KeyboardInterrupt:

@@ -86,8 +86,9 @@ body {
   padding: 14px;
   grid-template-columns: 360px minmax(0, 1fr);
   grid-template-areas:
-    "estado   consola"
-    "acciones consola";
+    "estado    consola"
+    "jugadores consola"
+    "acciones  consola";
   align-items: start;
   width: 100%;
   max-width: 1500px;
@@ -95,13 +96,14 @@ body {
 }
 
 #panel-estado { grid-area: estado; }
+#panel-jugadores { grid-area: jugadores; }
 #panel-acciones { grid-area: acciones; }
 #panel-consola { grid-area: consola; display: flex; flex-direction: column; }
 
 @media (max-width: 950px) {
   .rejilla {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: "estado" "acciones" "consola";
+    grid-template-areas: "estado" "jugadores" "acciones" "consola";
   }
 }
 
@@ -138,6 +140,30 @@ body {
 .fila .etiqueta { color: var(--texto-tenue); }
 .fila .valor { text-align: right; word-break: break-all; }
 .fila a { color: var(--rojo-vivo); }
+.alerta { color: var(--rojo-vivo); }
+
+/* ── jugadores ────────────────────────────────────────────────────────── */
+.jugadores-cifra {
+  font-size: 42px;
+  line-height: 1.1;
+  color: var(--rojo-vivo);
+  letter-spacing: 1px;
+  margin: 2px 0 10px;
+}
+.jugadores-cifra .chico { color: var(--texto-tenue); letter-spacing: 0; }
+.jugadores-sep { color: var(--texto-tenue); margin: 0 5px; }
+.jugadores-lista {
+  list-style: none;
+  max-height: 190px;
+  overflow-y: auto;
+  border-top: 1px dotted var(--rojo-oscuro);
+}
+.jugadores-lista li {
+  padding: 4px 0;
+  border-bottom: 1px dotted var(--rojo-oscuro);
+  overflow-wrap: anywhere;
+}
+.jugadores-lista li:last-child { border-bottom: 0; }
 
 /* ── botones ──────────────────────────────────────────────────────────── */
 .botones { display: flex; flex-direction: column; gap: 8px; }
@@ -172,10 +198,30 @@ button.mini {
 .consola-barra {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-bottom: 8px;
 }
 .consola-barra .chico { display: flex; align-items: center; gap: 5px; }
+.filtros { display: flex; gap: 4px; }
+.filtro.activo,
+button.mini.activo {
+  background: var(--rojo);
+  border-color: var(--rojo-vivo);
+  color: #000;
+}
+.buscar {
+  flex: 1 1 140px;
+  min-width: 110px;
+  background: var(--fondo-caja);
+  color: var(--texto);
+  border: 1px solid var(--borde);
+  font-family: inherit;
+  font-size: 14px;
+  padding: 3px 7px;
+}
+.buscar:focus { outline: 1px solid var(--rojo-vivo); }
+.consola-info { min-height: 18px; font-size: 13px; margin-bottom: 4px; }
 
 .consola-caja {
   background: var(--fondo-caja);
@@ -189,6 +235,7 @@ button.mini {
 }
 
 .consola-caja .linea { white-space: pre-wrap; }
+.consola-caja .linea[hidden] { display: none; }
 .consola-caja .linea:nth-child(even) { background: #0a0303; }
 
 /* colores ANSI del servidor (renombrados a la paleta) */
@@ -216,6 +263,7 @@ button.mini {
   gap: 8px;
   margin-top: 8px;
 }
+.entrada-caja { flex: 1; position: relative; min-width: 0; }
 .prompt {
   color: var(--rojo-vivo);
   font-size: 20px;
@@ -223,7 +271,7 @@ button.mini {
   text-align: center;
 }
 .entrada input {
-  flex: 1;
+  width: 100%;
   background: var(--fondo-caja);
   color: var(--texto);
   border: 1px solid var(--borde);
@@ -232,6 +280,35 @@ button.mini {
   padding: 8px 10px;
 }
 .entrada input:focus { outline: 1px solid var(--rojo-vivo); }
+
+.sugerencias {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 2px);
+  z-index: 20;
+  max-height: 210px;
+  overflow-y: auto;
+  background: var(--panel-alto);
+  border: 1px solid var(--rojo);
+  box-shadow: 0 6px 18px #000a;
+}
+.sugerencias[hidden] { display: none; }
+.sugerencias .sugerencia {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-bottom: 1px solid var(--borde);
+  background: transparent;
+  color: var(--texto);
+  font-size: 15px;
+  padding: 6px 9px;
+  letter-spacing: 0;
+}
+.sugerencias .sugerencia:hover,
+.sugerencias .sugerencia.activa { background: var(--rojo); color: #000; }
+.atajo { margin-top: 6px; }
 
 .rapidos {
   display: flex;
@@ -262,6 +339,7 @@ button.mini {
   max-width: 760px;
 }
 .modo-publico #panel-acciones,
+.modo-publico #panel-jugadores,
 .modo-publico #panel-consola { display: none; }
 
 .copiable {

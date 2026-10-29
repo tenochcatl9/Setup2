@@ -28,13 +28,17 @@ Modos:
                                        restaura el mundo desde un .tar.zst
   python3 setup_mc.py --publicar "msg" publica esta versión (panel y/o página)
   python3 setup_mc.py --actualizar     aplica la última versión publicada y sale
+  python3 setup_mc.py --actualizar-paper
+                                       sube Paper a la última estable, respalda
+                                       el mundo y sigue con el arranque normal
   python3 setup_mc.py --ui             solo la página local de control (localhost)
 
 UI local (localhost): al ejecutar el script se levanta una página de control en
 http://127.0.0.1:8080 (--puerto-ui, --sin-ui para desactivarla) con el estado
-del servidor, la consola (colores incluidos, comandos por el FIFO) y acciones
-(parar, arrancar, respaldar, probar webhook). El HTML/JS vive en webui/ y los
-temas (CSS) en templates/ (p. ej. templates/template_default.css).
+del servidor, los jugadores conectados, la consola detallada (colores, filtros,
+búsqueda y descarga) y comandos por el FIFO con autocompletado real con TAB.
+El navegador se abre solo (--sin-abrir-ui lo desactiva). El HTML/JS vive en
+webui/ y los temas (CSS) en templates/ (p. ej. templates/template_default.css).
 
 Panel (opcional, ver panel/README.md): con PANEL_URL y PANEL_API_KEY en .env
 el script se auto-actualiza al arrancar (--sin-actualizar lo desactiva),
@@ -62,7 +66,7 @@ cliente de Minecraft entre solo con el hostname. Si no está dado de alta o no
 responde, el script cae automáticamente a Pinggy (solo ssh, sin cuenta).
 """
 
-import argparse, signal, sys
+import argparse, os, signal, sys, threading
 
 
 # ─── Autoinstalación (un solo archivo) ───────────────────────────────────
@@ -156,7 +160,9 @@ from setup_mc.estado import modo_notificacion
 from setup_mc.gitops import configurar_gitignore, exigir_env_protegido
 from setup_mc.jars import configurar_authme, instalar_plugins, version_skinsrestorer
 from setup_mc.mcserver import arrancar_servidor, esperar_puerto, seguir_servidor
-from setup_mc.paper import aceptar_eula, comprobar_java, descargar_paper, generar_plugins_dir, servidor_existe
+from setup_mc.paper import (aceptar_eula, actualizar_paper, avisar_si_hay_nueva,
+                            comprobar_java, descargar_paper, generar_plugins_dir,
+                            revertir_paper, servidor_existe)
 from setup_mc.procesos import _detener_proceso, parar_todo
 from setup_mc.respaldo import importar_respaldo, preguntar_crear_o_importar, preguntar_url_respaldo, subir_cambios
 from setup_mc.tuneles import NotificadorTunel, PROVEEDORES, abrir_tunel, asyx_esta_alto, asyx_registrar, detener_tunel, diagnostico_tunel
@@ -223,6 +229,8 @@ def parse_args():
                    help="No buscar versiones nuevas (panel o página) al arrancar")
     p.add_argument("--actualizar", action="store_true",
                    help="Busca y aplica la última versión publicada (panel o página), y sale")
+    p.add_argument("--actualizar-paper", action="store_true",
+                   help="Actualiza Paper a la última estable, respalda el mundo y sigue arrancando")
     p.add_argument("--publicar", metavar="MENSAJE", default=None,
                    help="Publica esta versión: la sube al panel y/o despliega la página, y sale")
     p.add_argument("--ui", action="store_true",
@@ -231,6 +239,8 @@ def parse_args():
                    help="Puerto de la UI local (8080)")
     p.add_argument("--sin-ui", action="store_true",
                    help="No arrancar la UI local")
+    p.add_argument("--sin-abrir-ui", action="store_true",
+                   help="No abrir el navegador al arrancar la UI (la página sigue disponible)")
     p.add_argument("--rama", default="main", help="Rama a la que se empuja (main)")
     return p.parse_args()
 
@@ -283,7 +293,7 @@ def main():
     if args.parar:
         return parar_todo()
     if args.ui:
-        return webui.servir_foreground(args.puerto_ui)
+        return webui.servir_foreground(args.puerto_ui, abrir=not args.sin_abrir_ui)
     mcserver.MEMORIA_MAXIMA = args.memoria
     if mcserver.MEMORIA_INICIAL.endswith("G") and args.memoria.endswith("G"):
         mcserver.MEMORIA_INICIAL = f"{max(1, int(args.memoria[:-1]) // 2)}G"
@@ -348,14 +358,35 @@ def main():
             "Cuando arranque el servidor aquí irá la IP del túnel.")) else 1
 
     # 0e. UI local: página de control (estado, consola, acciones y temas)
+    if args.sin_actualizar:
+        os.environ["SETUP_MC_SIN_ACTUALIZAR"] = "1"
+    else:
+        os.environ.pop("SETUP_MC_SIN_ACTUALIZAR", None)
     puerto_ui = None
     if not args.sin_ui:
         puerto_ui = webui.lanzar_desacoplado(args.puerto_ui)
         if puerto_ui:
             log(f"UI local: {webui.url_local(puerto_ui)}")
+            if not args.sin_abrir_ui:
+                threading.Thread(target=webui.abrir_navegador, args=(puerto_ui,),
+                                 daemon=True).start()
+
+    # 0f. Aviso de versión de Paper; la actualización solo se hace si se pide.
+    if not args.sin_actualizar and not args.actualizar_paper:
+        threading.Thread(target=avisar_si_hay_nueva, daemon=True).start()
+
+    actualizacion = None
+    if args.actualizar_paper:
+        resultado = actualizar_paper()
+        if not resultado or not resultado.get("ok"):
+            return 1
+        if resultado.get("actualizada"):
+            actualizacion = resultado
 
     # 1. Servidor
     if not preparar_servidor(args):
+        if actualizacion:
+            revertir_paper(actualizacion)
         return 1
 
     servidor_proc = None
@@ -369,12 +400,17 @@ def main():
 
     if args.solo_notificar:
         try:
-            return modo_notificacion(args)
+            codigo = modo_notificacion(args)
+            if codigo != 0 and actualizacion:
+                revertir_paper(actualizacion)
+            return codigo
         except KeyboardInterrupt:
             aviso("Interrumpido por el usuario.")
             return 1
         except Exception as e:  # noqa: BLE001
             error(str(e))
+            if actualizacion:
+                revertir_paper(actualizacion)
             return 1
 
     webhook = ""
@@ -390,6 +426,7 @@ def main():
         servidor_proc, cola = arrancar_servidor(args.puerto)
         if not esperar_puerto(args.puerto, servidor_proc, cola=cola):
             raise RuntimeError(f"El servidor no abrió el puerto {args.puerto} a tiempo.")
+        actualizacion = None  # el Paper nuevo arrancó: no hay nada que revertir
         configurar_authme()  # la config de AuthMe existe tras el primer arranque
 
         # 3. Túnel con barra de carga (Asyx, con Pinggy de respaldo)
@@ -447,6 +484,8 @@ def main():
         motivo_apagado = "el usuario lo detuvo con Ctrl+C"
     except Exception as e:  # noqa: BLE001
         error(str(e))
+        if actualizacion:
+            revertir_paper(actualizacion)
         codigo = 1
         motivo_apagado = str(e)
     finally:

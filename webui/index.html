@@ -26,12 +26,23 @@
     <div id="estado-filas" class="filas"><p class="tenue">cargando…</p></div>
   </section>
 
+  <section class="panel" id="panel-jugadores">
+    <h2>jugadores <span id="jugadores-nota" class="tenue"></span></h2>
+    <div class="jugadores-cifra">
+      <span id="jugadores-online">—</span><span class="jugadores-sep">/</span><span id="jugadores-max">—</span><span class="tenue chico"> en línea</span>
+    </div>
+    <ul id="jugadores-lista" class="jugadores-lista">
+      <li class="tenue">servidor apagado</li>
+    </ul>
+  </section>
+
   <section class="panel" id="panel-acciones">
     <h2>acciones</h2>
     <div class="botones">
       <button id="btn-arrancar">arrancar servidor</button>
       <button id="btn-parar" class="critico">parar servidor + túnel</button>
       <button id="btn-respaldo">respaldo ahora</button>
+      <button id="btn-actualizar-paper" class="discreto" disabled>actualizar Paper</button>
       <button id="btn-webhook">probar webhook</button>
       <button id="btn-apagar" class="discreto">apagar la ui</button>
     </div>
@@ -42,16 +53,31 @@
     <h2>consola del servidor <span id="consola-nota" class="tenue"></span></h2>
     <div class="consola-barra">
       <label class="chico"><input type="checkbox" id="auto-scroll" checked> auto-scroll</label>
+      <span class="filtros">
+        <button class="mini filtro activo" data-filtro="todos">todo</button>
+        <button class="mini filtro" data-filtro="info">info</button>
+        <button class="mini filtro" data-filtro="warn">avisos</button>
+        <button class="mini filtro" data-filtro="error">errores</button>
+      </span>
+      <input id="buscar-consola" class="buscar" type="search" placeholder="buscar en la consola…"
+             autocomplete="off" spellcheck="false">
+      <button id="btn-pausa" class="mini">pausar</button>
+      <button id="btn-descargar" class="mini">descargar</button>
       <button id="btn-limpiar" class="mini">limpiar</button>
       <button id="btn-final" class="mini">ir al final</button>
     </div>
+    <p class="consola-info"><span id="consola-fuente" class="tenue"></span></p>
     <div id="consola" class="consola-caja" aria-live="polite"></div>
     <div class="entrada">
       <span class="prompt">&gt;</span>
-      <input id="comando" list="comandos" autocomplete="off" spellcheck="false"
-             placeholder="list · save-all · say hola · op TuNombre …">
+      <div class="entrada-caja">
+        <input id="comando" autocomplete="off" spellcheck="false"
+               placeholder="list · save-all · say hola · op TuNombre …">
+        <div id="sugerencias" class="sugerencias" hidden></div>
+      </div>
       <button id="btn-enviar">enviar</button>
     </div>
+    <p class="tenue chico atajo">TAB completa comandos y jugadores · Shift+TAB retrocede · ↑/↓ historial</p>
     <div class="rapidos">
       <span class="tenue chico">rápidos:</span>
       <button class="mini" data-cmd="list">list</button>
@@ -61,35 +87,6 @@
       <button class="mini" data-cmd="whitelist list">whitelist list</button>
       <button class="mini" data-cmd="stop" data-confirmar="¿Parar el servidor desde la consola? (equivale a cerrarlo sin tocar el túnel)">stop</button>
     </div>
-    <datalist id="comandos">
-      <option value="list"></option>
-      <option value="stop"></option>
-      <option value="save-all"></option>
-      <option value="save-all flush"></option>
-      <option value="save-off"></option>
-      <option value="save-on"></option>
-      <option value="tps"></option>
-      <option value="reload confirm"></option>
-      <option value="say "></option>
-      <option value="op "></option>
-      <option value="deop "></option>
-      <option value="kick "></option>
-      <option value="ban "></option>
-      <option value="pardon "></option>
-      <option value="whitelist on"></option>
-      <option value="whitelist off"></option>
-      <option value="whitelist list"></option>
-      <option value="whitelist add "></option>
-      <option value="whitelist remove "></option>
-      <option value="gamemode survival "></option>
-      <option value="gamemode creative "></option>
-      <option value="time set day"></option>
-      <option value="time set night"></option>
-      <option value="weather clear"></option>
-      <option value="difficulty normal"></option>
-      <option value="give "></option>
-      <option value="tp "></option>
-    </datalist>
   </section>
 
 </main>

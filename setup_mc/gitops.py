@@ -64,6 +64,11 @@ def _contenido_gitignore() -> str:
         # mientras quepa en git; si no cabe, se publica como release y esta
         # misma línea se añade aquí sola hasta que vuelva a caber.
         "respaldo/mundo-*.tar.zst",
+        # Respaldos previos a una actualización de Paper y el jar anterior:
+        # son locales (cientos de MB) y no deben entrar al historial.
+        "respaldo/antes-*.tar.zst",
+        "respaldo/server-*.jar",
+        "respaldo/authme-*.db",
         # Carpeta de la versión anterior del script; se ignora por si queda
         # alguna que no se haya reiniciado con el código nuevo.
         "respaldo/auto/",

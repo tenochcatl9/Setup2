@@ -35,6 +35,12 @@ BACKUP_EXCLUYE = [".env", ".env.*", ".git", "*.pid", "*.log", "*.part", "consola
                   "plugins/AuthMe/*.db", "plugins/AuthMe/*.db-wal",
                   "plugins/AuthMe/*.db-shm"]
 
+# El respaldo previo a actualizar Paper se queda en local (nunca se publica),
+# así que sí conserva las cuentas de AuthMe: si hay que volver atrás, los
+# jugadores no tienen que registrarse otra vez.
+BACKUP_EXCLUYE_LOCAL = [p for p in BACKUP_EXCLUYE
+                        if not p.startswith("plugins/AuthMe/")]
+
 TAMANO_ADVERTENCIA = 50 * 1024 * 1024
 
 TAMANO_MAXIMO = 100 * 1024 * 1024
@@ -192,10 +198,11 @@ def _version_paper() -> str:
          or re.search(r"running Paper version ([\w.\-]+)", texto))
     return m.group(1) if m else ""
 
-def _excluido(rel: str) -> bool:
+def _excluido(rel: str, patrones: list | None = None) -> bool:
     base = rel.rsplit("/", 1)[-1]
+    patrones = BACKUP_EXCLUYE if patrones is None else patrones
     return any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(base, pat)
-               for pat in BACKUP_EXCLUYE)
+               for pat in patrones)
 
 def _miembro_peligroso(rel: str) -> bool:
     """Un miembro del paquete es peligroso solo si es un secreto de verdad.
@@ -205,7 +212,8 @@ def _miembro_peligroso(rel: str) -> bool:
     """
     return bool(RE_SECRETO.search(rel))
 
-def _hash_contenido(directorio: Path, incluir: list) -> tuple:
+def _hash_contenido(directorio: Path, incluir: list,
+                    excluir: list | None = None) -> tuple:
     """(nº de archivos, sha256) del contenido empaquetado, estable entre máquinas."""
     archivos = []
     for patron in incluir:
@@ -218,7 +226,7 @@ def _hash_contenido(directorio: Path, incluir: list) -> tuple:
     total = 0
     for ruta in archivos:
         rel = ruta.relative_to(directorio).as_posix()
-        if _excluido(rel):
+        if _excluido(rel, excluir):
             continue
         total += 1
         resumen.update(rel.encode())
@@ -529,6 +537,56 @@ def crear_respaldo_instalacion() -> bool:
     return True
 
 
+def crear_respaldo_preactualizacion(version_origen: str) -> Path | None:
+    """Respaldo local completo antes de migrar el mundo a otra versión de Paper.
+
+    Va a `respaldo/antes-<versión>-<fecha>.tar.zst` (ignorado por Git: son cientos
+    de MB) e incluye mundo, configuración y el server.jar que se va a sustituir.
+    No se reutiliza `crear_respaldo()` porque este sí debe ser un paquete único,
+    con nombre propio, que no se sobrescriba con el respaldo rodante.
+    """
+    if not (SERVER_DIR / "world").is_dir():
+        error("No hay mundo que respaldar: no se actualiza Paper.")
+        return None
+    destino = RESPALDO_DIR / (
+        f"antes-{version_origen or 'actual'}-{time.strftime('%Y%m%d-%H%M%S')}.tar.zst")
+    incluir = [p for p in BACKUP_INCLUYE if (SERVER_DIR / p).exists()]
+    archivos, hash_contenido = _hash_contenido(SERVER_DIR, incluir,
+                                               BACKUP_EXCLUYE_LOCAL)
+    manifiesto = {
+        "creado": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "motivo": "antes de actualizar Paper",
+        "version_origen": version_origen or "desconocida",
+        "paper": _version_paper() or "desconocida",
+        "minecraft": _version_mc_del_jar() or "desconocida",
+        "con_server_jar": (SERVER_DIR / "server.jar").is_file(),
+        "contenido_sha256": hash_contenido,
+        "archivos": archivos,
+    }
+    referencia = _paquete_respaldo()
+    total_esperado = referencia.stat().st_size if referencia.is_file() else None
+    try:
+        _empaquetar(destino, manifiesto, incluir, total_esperado=total_esperado,
+                    excluir=BACKUP_EXCLUYE_LOCAL)
+    except (RuntimeError, OSError) as e:
+        error(f"No se pudo crear el respaldo previo: {e}")
+        destino.unlink(missing_ok=True)
+        return None
+    miembros = _miembros_de_respaldo(destino)
+    if MANIFIESTO not in miembros or not any(m.startswith("world/") for m in miembros):
+        destino.unlink(missing_ok=True)
+        error("El respaldo previo no contiene el mundo o su manifiesto; se borra.")
+        return None
+    malos = [m for m in miembros if _miembro_peligroso(m)]
+    if malos:
+        destino.unlink(missing_ok=True)
+        error("El respaldo previo contenía archivos sensibles; se borra.")
+        return None
+    ok(f"Respaldo previo a la actualización: {destino} "
+       f"({destino.stat().st_size / 1048576:,.0f} MB)")
+    return destino
+
+
 def _instalacion_al_dia() -> bool:
     """¿El respaldo de instalación ya lleva dentro el setup_mc.py de ahora?
 
@@ -556,12 +614,14 @@ def _instalacion_al_dia() -> bool:
     return guardado == actual
 
 def _empaquetar(destino: Path, manifiesto: dict, incluir: list,
-                total_esperado: int | None = None) -> tuple:
+                total_esperado: int | None = None,
+                excluir: list | None = None) -> tuple:
     """Escribe el tar comprimido con el manifiesto dentro. Devuelve (bytes, segundos).
 
     `total_esperado` no es obligatorio, pero sirve para que la barra muestre un
     porcentaje real: el tamaño comprimido solo se conoce al terminar, así que
-    se estima a partir del respaldo anterior.
+    se estima a partir del respaldo anterior. `excluir` permite un respaldo
+    local más completo (p. ej. con las cuentas de AuthMe).
     """
     compresor, _ = _compresor()
     destino.parent.mkdir(parents=True, exist_ok=True)
@@ -573,7 +633,7 @@ def _empaquetar(destino: Path, manifiesto: dict, incluir: list,
                # El mundo cambia mientras se empaqueta si el servidor está vivo:
                # eso son avisos, no errores.
                "--warning=no-file-changed", "--warning=no-file-removed"]
-        for patron in BACKUP_EXCLUYE:
+        for patron in (BACKUP_EXCLUYE if excluir is None else excluir):
             cmd += ["--exclude", patron]
         cmd += ["-C", tmp, MANIFIESTO, "-C", str(SERVER_DIR), *incluir]
         # stderr a fichero: si lo dejáramos en una tubería y tar escribiese mucho

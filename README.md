@@ -3,7 +3,8 @@
 Un comando despliega un servidor Paper listo para jugar: descarga el jar, instala
 los plugins, abre un túnel público, avisa por Discord, respalda el mundo y sube
 los cambios a Git. El propio script levanta una **página local de control**
-(estado, consola y acciones en el navegador); un panel opcional en Cloudflare
+(estado, jugadores, consola detallada y acciones en el navegador); un panel
+opcional en Cloudflare
 (carpeta `panel/`) permite auto-actualizar el script, cambiar la lista de
 plugins, ver el estado en vivo y publicar esa misma interfaz como página
 pública del servidor, y una **página de presentación** en Cloudflare Pages
@@ -19,7 +20,9 @@ python3 setup_mc.py
 ## Qué hace el script
 
 - **Java y Paper**: comprueba Java, descarga la última build de Paper para la
-  versión de MC que corresponda y configura eula/propiedades/ops.
+  versión de MC que corresponda y configura eula/propiedades/ops. Si hay una
+  versión estable nueva avisa al arrancar; la actualización la pides tú (botón
+  de la UI o `--actualizar-paper`) y conserva el mundo y a los jugadores.
 - **Plugins**: ViaVersion + ViaBackwards (compatibilidad de versiones), AuthMe
   (registro/login adaptado a túnel) y SkinsRestorer. La lista puede venir del
   panel sin tocar el código.
@@ -41,9 +44,11 @@ python3 setup_mc.py
 | `--ui` | Solo la página local de control (localhost), sin tocar el servidor |
 | `--puerto-ui N` | Puerto de la UI local (8080) |
 | `--sin-ui` | No arrancar la UI local |
+| `--sin-abrir-ui` | No abrir el navegador al arrancar (la página sigue disponible) |
 | `--publicar "mensaje"` | Publica esta versión: la sube al panel y/o despliega la página |
 | `--actualizar` | Aplica la última versión publicada (panel o página) y sale |
-| `--sin-actualizar` | No busca versiones nuevas (panel o página) al arrancar |
+| `--actualizar-paper` | Sube Paper a la última estable, respalda el mundo y sigue arrancando |
+| `--sin-actualizar` | No busca versiones nuevas (panel, página o Paper) ni avisa de ellas |
 | `--reinstalar-plugins` | Vuelve a descargar los plugins |
 | `--importar URL` | Restaura un mundo desde un respaldo (`owner/repo`, URL de GitHub o directa) |
 | `--probar-webhook` | Manda un mensaje de prueba a Discord y sale |
@@ -55,18 +60,45 @@ python3 setup_mc.py
 
 Al ejecutar el script se levanta una página de control en
 `http://127.0.0.1:8080` (en Codespaces, la URL reenviada aparece en la pestaña
-**PORTS**; también puede verse con `python3 setup_mc.py --ui`):
+**PORTS**; también puede verse con `python3 setup_mc.py --ui`). El navegador se
+abre solo al arrancar; `--sin-abrir-ui` lo evita y la página sigue disponible:
 
 - **Estado en vivo**: servidor (PID, puerto, memoria y tiempo en pie), túnel
-  (dirección y proveedor), versiones y panel remoto.
-- **Consola completa**: la salida del servidor tal cual (con colores ANSI) y
-  envío de comandos al servidor (`list`, `save-all`, `op …`) con historial,
-  autocompletado y botones rápidos. Funciona por el mismo canal (FIFO) que
+  (dirección y proveedor), versiones de Minecraft/Paper, si hay actualización
+  de Paper y panel remoto.
+- **Jugadores**: contador `en línea / máximo` y nombres, consultados al propio
+  servidor por el protocolo de estado de Minecraft (no hace falta RCON).
+- **Consola completa**: la salida del servidor tal cual (con colores ANSI),
+  filtros por nivel (info/avisos/errores), búsqueda, pausa, descarga del log y
+  envío de comandos al servidor (`list`, `save-all`, `op …`) con historial y
+  botones rápidos. Funciona por el mismo canal (FIFO) que
   `echo 'op Jugador' > consola`.
+- **TAB Complete**: completa comandos, subcomandos y nombres de jugadores
+  conectados (`op <TAB>`, `whitelist add <TAB>`, `gamemode creative <TAB>`…);
+  `Shift+TAB` retrocede y `↑`/`↓` recorren el historial.
 - **Acciones**: parar (servidor + túnel), arrancar (modo segundo plano),
-  respaldo ahora y prueba del webhook de Discord.
+  respaldo ahora, actualizar Paper y prueba del webhook de Discord.
 - **Temas**: cada `.css` de `templates/` es un tema seleccionable; el de
   defecto es `templates/template_default.css`.
+
+### Actualizar Paper conservando el mundo
+
+La actualización nunca es automática en cada arranque: si hay una estable
+nueva se muestra un aviso y el botón **actualizar Paper** se activa. También se
+puede lanzar desde la terminal:
+
+```bash
+python3 setup_mc.py --actualizar-paper
+```
+
+Antes de tocar nada se para servidor y túnel, se crea un respaldo local completo
+en `respaldo/antes-<versión>-<fecha>.tar.zst` (mundo, configuración, cuentas de
+AuthMe y jar) y se guarda el `server.jar` anterior en
+`respaldo/server-<versión>.jar` (ambos ignorados por Git). Después se descarga y
+verifica la versión nueva; el mundo se migra en el primer arranque de Paper, sin
+regenerarlo ni borrar construcciones.
+Si el jar nuevo no llega a arrancar, se restaura automáticamente el anterior.
+`--sin-actualizar` desactiva también la comprobación y el aviso de Paper.
 
 En modo desacoplado (`--solo-notificar`) la UI corre como proceso aparte y
 sobrevive a la salida del script; se apaga con su botón «apagar la ui». Solo
@@ -146,17 +178,17 @@ a la API. El despliegue del Worker está paso a paso en `panel/README.md`.
 | `ui` | Colores, logs, barra de progreso |
 | `procesos` | Lanzar/detener procesos, consola FIFO, PIDs |
 | `versiones` | Versión de Minecraft del `server.jar` |
-| `paper` | Descarga de Paper y comprobación de Java |
+| `paper` | Descarga y actualización de Paper (con respaldo/rollback), comprobación de Java |
 | `mcserver` | Arranque del servidor, memoria, espera del puerto |
 | `jars` | Plugins (GitHub/Modrinth), AuthMe, SkinsRestorer |
 | `gitops` | `.gitignore` gestionado, protección de secretos, git |
 | `avisos` | Discord: webhook, notificaciones |
 | `tuneles` | Asyx y Pinggy, notificador de progreso |
 | `estado` | Modo desacoplado (`--solo-notificar`) |
-| `respaldo` | Respaldos del mundo y de la instalación (lleva el script dentro), `subir_cambios` |
+| `respaldo` | Respaldos del mundo, de la instalación y previo a actualizar Paper, `subir_cambios` |
 | `panel` | Cliente del panel: auto-update (script e interfaz), latidos, plugins, `--publicar` |
 | `pagina` | Página pública (Pages): construir/desplegar y bajadas estáticas (interfaz y script) |
-| `webui` | Página local de control: API, consola por FIFO, acciones, temas |
+| `webui` | Página local de control: API, jugadores por SLP, consola por FIFO, acciones, temas |
 
 Fuera del paquete: `webui/` (HTML/JS de la página local), `templates/`
 (temas CSS; `template_default` es el de por defecto) y `pagina/` (la landing

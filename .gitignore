@@ -50,6 +50,9 @@ consola
 !respaldo/
 !respaldo/**
 respaldo/mundo-*.tar.zst
+respaldo/antes-*.tar.zst
+respaldo/server-*.jar
+respaldo/authme-*.db
 respaldo/auto/
 
 # Panel del Worker (Cloudflare): se versiona el código, no los secretos
