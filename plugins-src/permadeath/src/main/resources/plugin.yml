@@ -1,0 +1,14 @@
+name: Permadeath
+version: 1.0.0
+main: dev.tenohost.permadeath.PermadeathPlugin
+api-version: '26.3'
+description: Permadeath con espectador temporal, cofres de objetos y avisos en Discord.
+commands:
+  permadeath:
+    description: Activa el permadeath y configura el tiempo de revivir.
+    usage: /permadeath <on|off|time [cantidad] [d|h|m|s]>
+    permission: permadeath.admin
+permissions:
+  permadeath.admin:
+    description: Permite administrar el modo permadeath.
+    default: op

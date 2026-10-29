@@ -157,9 +157,7 @@ def construir_sitio(destino: Path, version: str, changelog: str = "") -> dict:
     landing = BASE_DIR / "pagina"
     if not landing.is_dir():
         raise FileNotFoundError(f"falta la carpeta de la página: {landing}")
-    for ruta in sorted(landing.iterdir()):
-        if ruta.is_file():
-            shutil.copy2(ruta, destino / ruta.name)
+    shutil.copytree(landing, destino, dirs_exist_ok=True)
 
     archivos_ui = []
     for logica, origen in panel.rutas_ui().items():
@@ -176,6 +174,45 @@ def construir_sitio(destino: Path, version: str, changelog: str = "") -> dict:
     indice = {"version": version, "cuando": time.time(), "archivos": archivos_ui}
     (destino / "ui" / "indice.json").write_text(
         json.dumps(indice, ensure_ascii=False, indent=2) + "\n")
+
+    plugin_dir = BASE_DIR / "plugins-src" / "permadeath"
+    mvn = shutil.which("mvn")
+    if not mvn:
+        raise RuntimeError("Página: hace falta Maven para compilar el plugin Permadeath.")
+    try:
+        compilacion = subprocess.run(
+            [mvn, "-q", "-f", str(plugin_dir / "pom.xml"), "package"],
+            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Página: no se pudo compilar Permadeath: {exc}") from exc
+    if compilacion.returncode != 0:
+        detalle = (compilacion.stderr or compilacion.stdout).strip()[-1200:]
+        raise RuntimeError(f"Página: falló la compilación de Permadeath:\n{detalle}")
+    jar = plugin_dir / "target" / "Permadeath.jar"
+    if not jar.is_file():
+        raise RuntimeError("Página: Maven terminó, pero no generó Permadeath.jar.")
+    jar_bytes = jar.read_bytes()
+    plugin_destino = destino / "plugins" / "Permadeath.jar"
+    plugin_destino.parent.mkdir(parents=True, exist_ok=True)
+    plugin_destino.write_bytes(jar_bytes)
+    manifest_plugins = {
+        "version": version,
+        "plugins": [{
+            "id": "permadeath",
+            "nombre": "Permadeath",
+            "version": "1.0.0",
+            "descripcion": (
+                "Muerte temporal en espectador, recuperación de inventario "
+                "en cofres y avisos en Discord."
+            ),
+            "archivo": "Permadeath.jar",
+            "sha256": hashlib.sha256(jar_bytes).hexdigest(),
+            "tamano": len(jar_bytes),
+        }],
+    }
+    (destino / "plugins" / "manifest.json").write_text(
+        json.dumps(manifest_plugins, ensure_ascii=False, indent=2) + "\n")
 
     paquete = panel._empaquetar_script()
     (destino / "script").mkdir(parents=True, exist_ok=True)
@@ -223,7 +260,7 @@ def publicar_pagina(version: str, mensaje: str = "") -> bool:
         destino = Path(tmp)
         try:
             manifest = construir_sitio(destino, version, mensaje)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             error(f"Página: no se pudo preparar el contenido: {exc}")
             return False
         log(f"Página: contenido listo (v{version}, paquete de {manifest['tamano']:,} bytes).")

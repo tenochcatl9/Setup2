@@ -11,18 +11,22 @@ Endpoints:
   GET  /tema/<x>.css   → templates/<x>.css  (temas: un .css por tema)
   GET  /api/salud      → marca de la UI (para no levantar duplicados)
   GET  /api/temas      → lista de temas disponibles
+  GET  /api/plugins    → lista de plugins locales instalados
+  GET  /api/plugins/catalog → plugins propios disponibles
+  POST /api/plugins/instalar → descarga y verifica un plugin de la tienda
   GET  /api/estado     → estado del servidor, del túnel y de las versiones
   GET  /api/consola    → líneas nuevas de logs/servidor.log (?desde=N)
   POST /api/consola    → manda un comando al servidor por el FIFO
   POST /api/accion     → parar | arrancar | respaldo | webhook | apagar_ui
 """
 
-import json, os, re, socket, struct, subprocess, sys, threading, time, urllib.request
+import hashlib, io, json, os, re, socket, struct, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import config
+from . import mcserver
 from . import pagina
 from .avisos import enviar_a_discord, obtener_webhook
 from .config import (BASE_DIR, FIFO_CONSOLA, LOG_SERVIDOR, LOG_TUNEL, LOGS_DIR,
@@ -40,6 +44,9 @@ WEBUI_DIR = BASE_DIR / "webui"
 TEMPLATES_DIR = BASE_DIR / "templates"
 PUERTO_UI_POR_DEFECTO = 8080
 TEMA_POR_DEFECTO = "template_default"
+MAX_PLUGIN_BYTES = 100 * 1024 * 1024
+RE_PLUGIN_NOMBRE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,123}\.jar$")
+CATALOGO_PLUGIN_IDS = {"permadeath"}
 
 _lanzado = {"ts": 0.0}          # cuándo se pidió arrancar el servidor (anti doble clic)
 _candado_respaldo = threading.Lock()
@@ -85,6 +92,164 @@ def _max_jugadores() -> int:
     except (OSError, ValueError):
         pass
     return 20
+
+def memoria_sistema() -> dict:
+    """Memoria del sistema disponible, limitada por cgroups cuando existan."""
+    try:
+        valores = {}
+        for linea in Path("/proc/meminfo").read_text().splitlines():
+            clave, bruto = linea.split(":", 1)
+            if clave in ("MemTotal", "MemAvailable"):
+                valores[clave] = int(bruto.strip().split()[0]) * 1024
+        total = valores["MemTotal"]
+        disponible = valores["MemAvailable"]
+    except (OSError, ValueError, KeyError, IndexError):
+        return {"total_mb": 0, "disponible_mb": 0}
+
+    for limite_ruta, uso_ruta in (
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+         Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")),
+    ):
+        try:
+            limite_texto = limite_ruta.read_text().strip()
+            limite = int(limite_texto) if limite_texto != "max" else 0
+            uso = int(uso_ruta.read_text().strip())
+            if 0 < limite < (1 << 60):
+                total = min(total, limite)
+                disponible = min(disponible, max(0, limite - uso))
+                break
+        except (OSError, ValueError):
+            continue
+    return {"total_mb": total // (1024 * 1024),
+            "disponible_mb": disponible // (1024 * 1024)}
+
+def listar_plugins_instalados() -> list:
+    """JARs instalados directamente en la carpeta plugins/."""
+    if not config.PLUGINS_DIR.exists():
+        return []
+    return [
+        {"nombre": archivo.name, "tamano": archivo.stat().st_size}
+        for archivo in sorted(config.PLUGINS_DIR.glob("*.jar"), key=lambda p: p.name.lower())
+        if archivo.is_file() and not archivo.is_symlink()
+    ]
+
+def guardar_plugin(nombre: str, datos: bytes, reemplazar: bool = False) -> str:
+    """Valida e instala atómicamente un plugin JAR sin reiniciar el servidor."""
+    if not RE_PLUGIN_NOMBRE.fullmatch(nombre):
+        raise ValueError("nombre inválido: usa un archivo .jar sin rutas.")
+    if not datos or len(datos) > MAX_PLUGIN_BYTES:
+        raise ValueError("el plugin debe ocupar entre 1 byte y 100 MB.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(datos)) as archivo:
+            nombres = set(archivo.namelist())
+    except (OSError, zipfile.BadZipFile):
+        raise ValueError("el archivo no es un JAR/ZIP válido.")
+    if not ({"plugin.yml", "paper-plugin.yml"} & nombres):
+        raise ValueError("el JAR no contiene plugin.yml ni paper-plugin.yml.")
+
+    destino = config.PLUGINS_DIR / nombre
+    if destino.exists() and not reemplazar:
+        raise FileExistsError(f"{nombre} ya existe; confirma el reemplazo para actualizarlo.")
+    config.PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+    temporal = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=config.PLUGINS_DIR, prefix=".plugin-",
+                                         suffix=".part", delete=False) as archivo:
+            temporal = Path(archivo.name)
+            archivo.write(datos)
+        os.replace(temporal, destino)
+    finally:
+        if temporal is not None:
+            temporal.unlink(missing_ok=True)
+    return nombre
+
+def _obtener_manifest_plugins() -> tuple:
+    """Carga el catálogo de la página pública configurada."""
+    url, _ = pagina.pagina_config()
+    if not url or urlsplit(url).scheme != "https":
+        raise RuntimeError("la página de plugins no está configurada con HTTPS.")
+    solicitud = urllib.request.Request(
+        f"{url}/plugins/manifest.json",
+        headers={"User-Agent": "setup-mc-plugin-installer"},
+    )
+    try:
+        with urllib.request.urlopen(solicitud, timeout=15) as respuesta:
+            if respuesta.status != 200:
+                raise RuntimeError(f"el catálogo respondió HTTP {respuesta.status}.")
+            contenido = respuesta.read(256 * 1024 + 1)
+            if len(contenido) > 256 * 1024:
+                raise RuntimeError("el catálogo de plugins es demasiado grande.")
+            datos = json.loads(contenido)
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise RuntimeError(f"no se pudo leer el catálogo de plugins: {exc}") from exc
+    if not isinstance(datos, dict) or not isinstance(datos.get("plugins"), list):
+        raise RuntimeError("el catálogo de plugins no tiene un formato válido.")
+    return url, datos
+
+def plugins_catalogo() -> list:
+    """Plugins propios disponibles para instalar desde Pages."""
+    _url, manifest = _obtener_manifest_plugins()
+    disponibles = []
+    for plugin in manifest["plugins"]:
+        if not isinstance(plugin, dict) or plugin.get("id") not in CATALOGO_PLUGIN_IDS:
+            continue
+        disponibles.append({
+            "id": plugin["id"],
+            "nombre": str(plugin.get("nombre") or ""),
+            "version": str(plugin.get("version") or ""),
+            "descripcion": str(plugin.get("descripcion") or ""),
+        })
+    return disponibles
+
+def instalar_plugin_catalogo(plugin_id: str) -> str:
+    """Descarga un JAR permitido del catálogo, valida su hash y lo guarda."""
+    if plugin_id not in CATALOGO_PLUGIN_IDS:
+        raise ValueError(f"plugin desconocido: {plugin_id}")
+    url, manifest = _obtener_manifest_plugins()
+    plugin = next((p for p in manifest["plugins"]
+                   if isinstance(p, dict) and p.get("id") == plugin_id), None)
+    if plugin is None:
+        raise RuntimeError(f"{plugin_id} no está publicado en el catálogo.")
+    nombre = str(plugin.get("archivo") or "")
+    esperado = str(plugin.get("sha256") or "")
+    if (not RE_PLUGIN_NOMBRE.fullmatch(nombre)
+            or not re.fullmatch(r"[a-fA-F0-9]{64}", esperado)):
+        raise RuntimeError("el catálogo no publica un nombre o SHA-256 válido.")
+    solicitud = urllib.request.Request(
+        f"{url}/plugins/{quote(nombre)}",
+        headers={"User-Agent": "setup-mc-plugin-installer"},
+    )
+    try:
+        with urllib.request.urlopen(solicitud, timeout=60) as respuesta:
+            if respuesta.status != 200:
+                raise RuntimeError(f"la descarga respondió HTTP {respuesta.status}.")
+            datos = respuesta.read(MAX_PLUGIN_BYTES + 1)
+    except (OSError, urllib.error.URLError) as exc:
+        raise RuntimeError(f"no se pudo descargar {nombre}: {exc}") from exc
+    if len(datos) > MAX_PLUGIN_BYTES:
+        raise RuntimeError("el JAR supera el máximo permitido de 100 MB.")
+    if hashlib.sha256(datos).hexdigest().lower() != esperado.lower():
+        raise RuntimeError("el SHA-256 del JAR no coincide con el catálogo.")
+    return guardar_plugin(nombre, datos, reemplazar=True)
+
+def _origen_paginas() -> str:
+    url, _ = pagina.pagina_config()
+    partes = urlsplit(url)
+    return f"{partes.scheme}://{partes.netloc}" if partes.scheme and partes.netloc else ""
+
+def _origen_permitido(request: BaseHTTPRequestHandler) -> bool:
+    origen = request.headers.get("Origin", "")
+    return bool(origen and origen == _origen_paginas())
+
+def validar_memoria(memoria: str) -> str:
+    """Acepta un máximo entero en GB antes de pasarlo a la línea de comandos."""
+    if not re.fullmatch(r"[1-9][0-9]{0,2}G", memoria):
+        raise ValueError("la RAM debe ser un número entero de 1 a 128 GB.")
+    gigas = int(memoria[:-1])
+    if gigas > 128:
+        raise ValueError("la RAM máxima permitida desde la UI es 128 GB.")
+    return f"{gigas}G"
 
 def _varint(numero: int) -> bytes:
     """Varint sin signo del protocolo de Minecraft."""
@@ -237,6 +402,8 @@ def estado() -> dict:
             "uptime_seg": _uptime(pid_srv) if propio else None,
             "xmx": _xmx(pid_srv) if propio else "",
         },
+        "memoria_sistema": memoria_sistema(),
+        "memoria_configurada": mcserver.MEMORIA_MAXIMA,
         "tunel": _tunel_info(),
         "jugadores": estado_jugadores(puerto),
         "paper": estado_paper(),
@@ -307,9 +474,13 @@ def _accion_parar() -> tuple:
     threading.Thread(target=_tarea, daemon=True).start()
     return True, "parando servidor y túnel (el mundo se guarda; sigue la consola)"
 
-def _accion_arrancar() -> tuple:
+def _accion_arrancar(memoria: str = mcserver.MEMORIA_MAXIMA) -> tuple:
     if _vivo(_leer_pid(PID_SERVIDOR)) or puerto_abierto(_puerto_servidor()):
         return False, "ya hay un servidor en marcha"
+    try:
+        memoria = validar_memoria(memoria)
+    except ValueError as exc:
+        return False, str(exc)
     ahora = time.time()
     if ahora - _lanzado["ts"] < 90:
         return False, "ya se está arrancando (tarda un poco; mira la consola)"
@@ -318,7 +489,7 @@ def _accion_arrancar() -> tuple:
         mango = open(LOGS_DIR / "arranque-ui.log", "a", buffering=1)
         subprocess.Popen(
             [sys.executable, str(BASE_DIR / "setup_mc.py"), "--solo-notificar",
-             "--sin-ui", "--sin-abrir-ui"],
+             "--sin-ui", "--sin-abrir-ui", "--memoria", memoria],
             cwd=str(BASE_DIR), stdin=subprocess.DEVNULL, stdout=mango,
             stderr=subprocess.STDOUT, start_new_session=True,
         )
@@ -371,13 +542,13 @@ def _accion_webhook() -> tuple:
         return True, "mensaje de prueba enviado a Discord"
     return False, "Discord rechazó el mensaje (revisa el webhook)"
 
-def ejecutar_accion(nombre: str, servidor=None) -> tuple:
+def ejecutar_accion(nombre: str, servidor=None, memoria: str = mcserver.MEMORIA_MAXIMA) -> tuple:
     """Devuelve (código HTTP, cuerpo JSON) para POST /api/accion."""
     if nombre == "parar":
         ok_, detalle = _accion_parar()
         return 200, {"ok": ok_, "detalle": detalle}
     if nombre == "arrancar":
-        ok_, detalle = _accion_arrancar()
+        ok_, detalle = _accion_arrancar(memoria)
         return (200 if ok_ else 409), {"ok": ok_, "detalle": detalle}
     if nombre == "respaldo":
         ok_, detalle = _accion_respaldo()
@@ -409,6 +580,11 @@ class _Manejador(BaseHTTPRequestHandler):
         self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(cuerpo)))
         self.send_header("Cache-Control", "no-store")
+        origen = self.headers.get("Origin", "")
+        if origen == _origen_paginas() and _origen_permitido(self):
+            self.send_header("Access-Control-Allow-Origin", origen)
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Vary", "Origin")
         self.end_headers()
         try:
             self.wfile.write(cuerpo)
@@ -448,7 +624,8 @@ class _Manejador(BaseHTTPRequestHandler):
             largo = int(self.headers.get("Content-Length") or 0)
             if largo <= 0 or largo > 65536:
                 return {}
-            return json.loads(self.rfile.read(largo) or b"{}")
+            datos = json.loads(self.rfile.read(largo) or b"{}")
+            return datos if isinstance(datos, dict) else {}
         except (ValueError, OSError):
             return {}
 
@@ -469,6 +646,16 @@ class _Manejador(BaseHTTPRequestHandler):
                                "puerto": self.server.server_port})
         if ruta == "/api/temas":
             return self._json({"temas": listar_temas(), "defecto": TEMA_POR_DEFECTO})
+        if ruta == "/api/plugins":
+            try:
+                return self._json({"plugins": listar_plugins_instalados()})
+            except OSError as exc:
+                return self._json({"error": f"no se pudo leer plugins/: {exc}"}, 500)
+        if ruta == "/api/plugins/catalog":
+            try:
+                return self._json({"plugins": plugins_catalogo()})
+            except (OSError, RuntimeError) as exc:
+                return self._json({"error": str(exc)}, 502)
         if ruta == "/api/estado":
             return self._json(estado())
         if ruta == "/api/consola/descargar":
@@ -481,8 +668,68 @@ class _Manejador(BaseHTTPRequestHandler):
             return self._json(leer_consola(max(0, desde)))
         return self._json({"error": "ruta no encontrada"}, 404)
 
+    def do_OPTIONS(self):
+        if (not _origen_permitido(self)
+                or self.headers.get("Origin") != _origen_paginas()):
+            return self._json({"error": "origen no permitido"}, 403)
+        metodo = self.headers.get("Access-Control-Request-Method", "")
+        cabeceras = {
+            valor.strip().lower()
+            for valor in self.headers.get("Access-Control-Request-Headers", "").split(",")
+            if valor.strip()
+        }
+        if metodo not in ("GET", "POST") or not cabeceras.issubset(
+                {"cache-control", "content-type"}):
+            return self._json({"error": "solicitud CORS no permitida"}, 403)
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", _origen_paginas())
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Cache-Control, Content-Type")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Max-Age", "300")
+        self.send_header("Vary", "Origin")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
-        ruta = urlsplit(self.path).path.rstrip("/") or "/"
+        partes = urlsplit(self.path)
+        ruta = partes.path.rstrip("/") or "/"
+        if ruta == "/api/plugins/instalar":
+            if not _origen_permitido(self):
+                return self._json({"error": "origen no permitido; conecta desde la página oficial"}, 403)
+            cuerpo = self._cuerpo_json()
+            plugin_id = str(cuerpo.get("plugin") or "")
+            try:
+                nombre = instalar_plugin_catalogo(plugin_id)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            except (OSError, RuntimeError) as exc:
+                return self._json({"error": str(exc)}, 502)
+            return self._json({"ok": True, "nombre": nombre,
+                               "detalle": "instalado; se cargará al próximo arranque"})
+        if ruta.startswith("/api/plugins/"):
+            if self.headers.get("X-Setup2-Plugin-Upload") != "1":
+                return self._json({"error": "falta la cabecera de carga local"}, 403)
+            nombre = unquote(ruta.removeprefix("/api/plugins/"))
+            try:
+                largo = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._json({"error": "tamaño de archivo inválido"}, 400)
+            if largo <= 0 or largo > MAX_PLUGIN_BYTES:
+                return self._json({"error": "el plugin debe ocupar entre 1 byte y 100 MB"}, 413)
+            datos = self.rfile.read(largo)
+            if len(datos) != largo:
+                return self._json({"error": "la carga del archivo quedó incompleta"}, 400)
+            reemplazar = "1" in parse_qs(partes.query).get("reemplazar", [])
+            try:
+                nombre = guardar_plugin(nombre, datos, reemplazar)
+            except FileExistsError as exc:
+                return self._json({"error": str(exc)}, 409)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            except OSError as exc:
+                return self._json({"error": f"no se pudo guardar el plugin: {exc}"}, 500)
+            return self._json({"ok": True, "nombre": nombre})
         cuerpo = self._cuerpo_json()
         if ruta == "/api/consola":
             comando = str(cuerpo.get("comando") or "").strip()
@@ -492,12 +739,15 @@ class _Manejador(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             return self._json({"error": "la consola no está disponible (¿servidor parado?)"}, 409)
         if ruta == "/api/accion":
-            codigo, respuesta = ejecutar_accion(str(cuerpo.get("accion") or ""), self.server)
+            codigo, respuesta = ejecutar_accion(
+                str(cuerpo.get("accion") or ""), self.server,
+                str(cuerpo.get("memoria") or mcserver.MEMORIA_MAXIMA))
             return self._json(respuesta, codigo)
         return self._json({"error": "ruta no encontrada"}, 404)
 
 def _crear_servidor(puerto: int) -> ThreadingHTTPServer:
-    servidor = ThreadingHTTPServer(("127.0.0.1", puerto), _Manejador)
+    host = "0.0.0.0" if os.environ.get("CODESPACE_NAME") else "127.0.0.1"
+    servidor = ThreadingHTTPServer((host, puerto), _Manejador)
     servidor.daemon_threads = True
     return servidor
 
@@ -549,7 +799,31 @@ def abrir_navegador(puerto: int) -> bool:
     False aunque el navegador se abra en segundo plano, así que el fallback es
     solo informativo.
     """
-    url = url_codespaces(puerto) or url_local(puerto)
+    url = url_codespaces(puerto)
+    if url:
+        class NoSeguirRedirecciones(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoSeguirRedirecciones)
+        limite = time.monotonic() + 20
+        while time.monotonic() < limite:
+            try:
+                with opener.open(url + "/api/salud", timeout=2) as response:
+                    if 200 <= response.status < 400:
+                        break
+            except urllib.error.HTTPError as exc:
+                if 300 <= exc.code < 400:
+                    break
+            except (OSError, urllib.error.URLError):
+                pass
+            time.sleep(0.5)
+        else:
+            log(f"UI local activa en {url_local(puerto)}, pero Codespaces aún no "
+                f"reenvía el puerto {puerto}; revisa la pestaña PORTS.")
+            return False
+    else:
+        url = url_local(puerto)
     try:
         import webbrowser
         if webbrowser.open(url, new=2):
@@ -577,18 +851,24 @@ def lanzar_desacoplado(puerto_preferido: int = PUERTO_UI_POR_DEFECTO):
     try:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         mango = open(LOGS_DIR / "webui.log", "a", buffering=1)
-        subprocess.Popen(
+        proceso = subprocess.Popen(
             [sys.executable, "-m", "setup_mc.webui", "--puerto", str(puerto)],
             cwd=str(BASE_DIR), stdin=subprocess.DEVNULL, stdout=mango,
             stderr=subprocess.STDOUT, start_new_session=True,
         )
     except OSError:
         return None
-    for _ in range(40):                     # hasta ~6 s a que conteste
+    for _ in range(100):                    # hasta ~15 s a que conteste
         if _salud(puerto):
             return puerto
+        if proceso.poll() is not None:
+            error(f"La UI terminó al arrancar (código {proceso.returncode}); "
+                  f"revisa {LOGS_DIR / 'webui.log'}.")
+            return None
         time.sleep(0.15)
-    return puerto                           # puede tardar algo más ya arrancando
+    proceso.terminate()
+    error(f"La UI no respondió en el puerto {puerto}; revisa {LOGS_DIR / 'webui.log'}.")
+    return None
 
 def _refresco_silencioso() -> None:
     """Baja interfaz nueva del panel o de la página, si la hay (sin ruido)."""

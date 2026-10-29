@@ -73,13 +73,20 @@ abre solo al arrancar; `--sin-abrir-ui` lo evita y la página sigue disponible:
   envío de comandos al servidor (`list`, `save-all`, `op …`) con historial y
   botones rápidos. Funciona por el mismo canal (FIFO) que
   `echo 'op Jugador' > consola`.
+- **RAM del servidor**: muestra la memoria disponible y permite elegir el máximo
+  en GB antes de arrancar; el valor se conserva en el navegador.
+- **Plugins**: barra lateral oculta por defecto con la lista de `.jar` y carga
+  por arrastrar y soltar. Solo admite JARs con `plugin.yml` o
+  `paper-plugin.yml`; se aplican en el siguiente arranque, sin parar el servidor
+  actual.
 - **TAB Complete**: completa comandos, subcomandos y nombres de jugadores
   conectados (`op <TAB>`, `whitelist add <TAB>`, `gamemode creative <TAB>`…);
   `Shift+TAB` retrocede y `↑`/`↓` recorren el historial.
 - **Acciones**: parar (servidor + túnel), arrancar (modo segundo plano),
   respaldo ahora, actualizar Paper y prueba del webhook de Discord.
-- **Temas**: cada `.css` de `templates/` es un tema seleccionable; el de
-  defecto es `templates/template_default.css`.
+- **Temas**: cada `.css` de `templates/` es un tema seleccionable: Default,
+  Monokai, Mint, Dark Mode y Light Mode. Algunos temas cambian también el orden
+  de los paneles.
 
 ### Actualizar Paper conservando el mundo
 
@@ -116,13 +123,15 @@ script; además, la raíz del panel muestra esa misma página en **modo público
 
 En `pagina/` vive la página de presentación (guía de uso y descarga del
 script, nada del panel) que se publica en Cloudflare Pages, por defecto
-`https://tenohost.pages.dev`. Junto a ella se publican dos bloques:
+`https://tenohost.pages.dev`. Junto a ella se publican tres bloques:
 
 - `script/` — `setup_mc.py` suelto (un solo archivo: si el paquete no está a
   su lado, se lo baja solo al ejecutarse), el paquete `setup_mc.tar.gz` y un
   `manifest.json` con versión, sha256 y changelog.
 - `ui/` — la interfaz local (`index.html`, `app.js`, `templates/*.css`) y un
   `indice.json` con rutas y sha256.
+- `plugins/` — tienda web, JARs publicados y `manifest.json` con SHA-256. El
+  paquete Permadeath se compila desde `plugins-src/` al publicar.
 
 Con `PAGINA_URL` en `.env` (por defecto la de arriba; `PAGINA_URL=no` la
 desactiva) el script baja de ahí la interfaz al arrancar y también las
@@ -135,6 +144,24 @@ Pages) y ejecuta `python3 setup_mc.py --publicar "qué cambió"` en una máquina
 con `npx wrangler` autenticado (`npx wrangler login`). El primer despliegue
 crea el proyecto.
 
+La página principal enlaza a `/plugins/`, la tienda de plugins propios. La
+instalación se conecta con la UI local y verifica el SHA-256 del JAR antes de
+guardarlo en `plugins/`; el servidor en marcha no se detiene ni carga plugins
+en caliente. Permadeath se compila desde `plugins-src/permadeath/` al publicar
+(requiere Maven) y, una vez cargado en Paper, es opt-in:
+
+```text
+/permadeath on
+/permadeath time 2 hours
+/permadeath off
+```
+
+Al morir en modo activo, el jugador queda como espectador hasta el fin del
+tiempo, ve la cuenta atrás, y se guarda una copia de inventario, armadura y
+mano secundaria en cofres en el lugar de muerte (con cofres adicionales si es
+necesario). La causa original se usa como motivo de baneo temporal y se envía
+al webhook de Discord configurado en `.env`, junto con la ilustración SVG.
+
 ## Panel (opcional)
 
 En `panel/` vive un Worker de Cloudflare que sirve:
@@ -146,6 +173,9 @@ En `panel/` vive un Worker de Cloudflare que sirve:
 - `GET /app.js` y `GET /tema/<x>.css` — archivos de la interfaz publicada.
 - `GET /api/estado` — estado en el formato de la UI (público, para la página).
 - `GET /api/temas` — temas publicados.
+- La UI local añade `GET /api/plugins` para listar los `.jar` y
+  `POST /api/plugins/<archivo.jar>` para validarlos y guardarlos para el próximo
+  arranque; esta carga no está disponible en la página pública.
 - `GET /api/manifest` — última versión publicada del script (versión, sha256,
   changelog, url del paquete). Es lo que consulta el script al arrancar.
 - `GET /api/plugins` — registro de plugins que instala el script.

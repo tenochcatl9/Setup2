@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Permadeath</title>
+  <rect width="128" height="128" fill="#100404"/>
+  <path d="M64 12 111 36v56l-47 24-47-24V36z" fill="#170606" stroke="#a80f0f" stroke-width="4"/>
+  <path d="M64 29 99 47v35l-35 18-35-18V47z" fill="#030000" stroke="#ff2626" stroke-width="3"/>
+  <path d="m52 48 26 1-13 18 13 1-28 25 8-20-13-1z" fill="#ff2626"/>
+  <path d="M22 104h84" stroke="#eadcdc" stroke-width="4"/>
+</svg>

@@ -39,10 +39,17 @@ async function cargarTemas() {
   } catch (e) { /* seguimos con el tema por defecto del <link> */ }
   const sel = $("selector-tema");
   sel.innerHTML = "";
+  const etiquetas = {
+    template_default: "Default",
+    tema_monokai: "Monokai",
+    tema_mint: "Mint",
+    tema_dark: "Dark Mode",
+    tema_light: "Light Mode",
+  };
   for (const tema of temas) {
     const op = document.createElement("option");
     op.value = tema;
-    op.textContent = tema;
+    op.textContent = etiquetas[tema] || tema;
     sel.appendChild(op);
   }
   let elegido = localStorage.getItem("tema") || "template_default";
@@ -59,6 +66,7 @@ async function cargarTemas() {
 let modo = "local";         // "local" (localhost) o "publico" (página del panel)
 let direccionActual = "";   // dirección del túnel, para copiar al clic
 let jugadoresActuales = []; // nombres de los jugadores conectados (para TAB)
+let memoriaInicializada = false;
 
 function hace(segundos) {
   if (segundos == null) return "";
@@ -100,6 +108,7 @@ async function refrescarEstado() {
   aplicarModo(e.modo || "local");
   const s = e.servidor || {}, t = e.tunel || {}, sc = e.script || {};
   const j = e.jugadores || {}, p = e.paper || {};
+  const ram = e.memoria_sistema || {};
   const enMarcha = !!(s.vivo && s.puerto_abierto);
 
   $("indicador").className = "indicador " + (enMarcha ? "vivo" : "muerto");
@@ -150,6 +159,28 @@ async function refrescarEstado() {
   }
 
   $("estado-filas").innerHTML = html;
+  const controlMemoria = $("memoria-maxima");
+  if (!memoriaInicializada) {
+    const guardada = localStorage.getItem("memoria-maxima");
+    const memoriaDetectada = String(s.xmx || e.memoria_configurada || "8G").match(/^(\d+)([MG])$/);
+    const detectada = memoriaDetectada
+      ? Number(memoriaDetectada[1]) / (memoriaDetectada[2] === "M" ? 1024 : 1)
+      : 8;
+    const preferida = Number(guardada);
+    controlMemoria.value = Number.isInteger(preferida) && preferida >= 1 && preferida <= 128
+      ? preferida
+      : Math.max(1, Math.min(128, Math.round(Number.isFinite(detectada) ? detectada : 8)));
+    memoriaInicializada = true;
+  }
+  controlMemoria.disabled = enMarcha || modo === "publico";
+  const disponible = Number(ram.disponible_mb || 0);
+  const total = Number(ram.total_mb || 0);
+  $("ram-info").dataset.disponible = String(disponible);
+  $("ram-info").textContent = total
+    ? `RAM disponible: ${(disponible / 1024).toFixed(1)} de ${(total / 1024).toFixed(1)} GB`
+    : "no se pudo detectar la RAM del sistema";
+  $("ram-info").classList.toggle(
+    "alerta", disponible > 0 && Number(controlMemoria.value) * 1024 > disponible);
 
   // Jugadores: el contador es exacto aunque la lista de nombres venga vacía.
   jugadoresActuales = Array.isArray(j.nombres) ? j.nombres.filter(Boolean) : [];
@@ -537,7 +568,7 @@ function completarTab(ev) {
 }
 
 // ── acciones ──────────────────────────────────────────────────────────────
-async function accion(nombre, confirmar) {
+async function accion(nombre, confirmar, datos = {}) {
   if (modo === "publico") return;     // las acciones solo existen en localhost
   if (confirmar && !window.confirm(confirmar)) return;
   const aviso = $("aviso-accion");
@@ -546,7 +577,7 @@ async function accion(nombre, confirmar) {
     const r = await fetch("/api/accion", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ accion: nombre }),
+      body: JSON.stringify({ accion: nombre, ...datos }),
     });
     const d = await r.json().catch(() => ({}));
     aviso.textContent = (r.ok ? "✓ " : "✗ ") + (d.detalle || d.error || nombre);
@@ -613,7 +644,27 @@ for (const b of document.querySelectorAll("[data-cmd]")) {
   });
 }
 
-$("btn-arrancar").addEventListener("click", () => accion("arrancar"));
+$("memoria-maxima").addEventListener("change", () => {
+  const memoria = Number($("memoria-maxima").value);
+  if (!Number.isInteger(memoria) || memoria < 1 || memoria > 128) {
+    $("aviso-accion").textContent = "✗ elige una cantidad entera entre 1 y 128 GB";
+    $("memoria-maxima").value = Math.max(1, Math.min(128, Math.round(memoria || 8)));
+    return;
+  }
+  localStorage.setItem("memoria-maxima", String(memoria));
+  $("ram-info").classList.toggle(
+    "alerta", Number($("ram-info").dataset.disponible || 0) > 0
+      && Number($("ram-info").dataset.disponible) < memoria * 1024);
+});
+$("btn-arrancar").addEventListener("click", () => {
+  const memoria = Number($("memoria-maxima").value);
+  if (!Number.isInteger(memoria) || memoria < 1 || memoria > 128) {
+    $("aviso-accion").textContent = "✗ elige una cantidad entera entre 1 y 128 GB";
+    return;
+  }
+  localStorage.setItem("memoria-maxima", String(memoria));
+  accion("arrancar", "", { memoria: `${memoria}G` });
+});
 $("btn-parar").addEventListener("click", () =>
   accion("parar", "¿Parar el servidor y cerrar el túnel? Minecraft guardará el mundo primero."));
 $("btn-respaldo").addEventListener("click", () => accion("respaldo"));
@@ -633,6 +684,110 @@ $("btn-apagar").addEventListener("click", () => {
       "para volver, ejecuta <code>python3 setup_mc.py --ui</code> (" +
       "el script también la levanta solo al arrancar).</main>";
   });
+});
+
+// ── plugins (solo disponibles en la UI local) ────────────────────────────
+function mostrarPlugins(plugins) {
+  const lista = $("lista-plugins");
+  lista.replaceChildren();
+  if (!plugins.length) {
+    const vacio = document.createElement("li");
+    vacio.className = "tenue";
+    vacio.textContent = "no hay plugins instalados";
+    lista.appendChild(vacio);
+    return;
+  }
+  for (const plugin of plugins) {
+    const elemento = document.createElement("li");
+    const nombre = document.createElement("span");
+    nombre.textContent = plugin.nombre;
+    const tamano = document.createElement("span");
+    tamano.className = "tenue chico";
+    tamano.textContent = `${(plugin.tamano / 1024 / 1024).toFixed(1)} MB`;
+    elemento.append(nombre, tamano);
+    lista.appendChild(elemento);
+  }
+}
+
+async function refrescarPlugins() {
+  try {
+    const respuesta = await fetch("/api/plugins");
+    const datos = await respuesta.json();
+    if (!respuesta.ok) throw new Error(datos.error || `error ${respuesta.status}`);
+    mostrarPlugins(Array.isArray(datos.plugins) ? datos.plugins : []);
+  } catch (error) {
+    $("lista-plugins").innerHTML = "";
+    const elemento = document.createElement("li");
+    elemento.className = "tenue";
+    elemento.textContent = `no se pudo leer la lista: ${error.message}`;
+    $("lista-plugins").appendChild(elemento);
+  }
+}
+
+function abrirPlugins(abrir) {
+  const panel = $("sidebar-plugins");
+  panel.hidden = !abrir;
+  $("btn-plugins").setAttribute("aria-expanded", String(abrir));
+  if (abrir) {
+    refrescarPlugins();
+    $("btn-tienda-plugins").href =
+      `https://tenohost.pages.dev/plugins/?server=${encodeURIComponent(location.origin)}`;
+  }
+}
+
+async function cargarPlugins(archivos) {
+  const aviso = $("aviso-plugins");
+  for (const archivo of archivos) {
+    if (!archivo.name.toLowerCase().endsWith(".jar")) {
+      aviso.textContent = `✗ ${archivo.name}: solo se aceptan archivos .jar`;
+      continue;
+    }
+    const existente = Array.from($("lista-plugins").children)
+      .some((elemento) => elemento.firstChild?.textContent === archivo.name);
+    const reemplazar = existente && window.confirm(
+      `${archivo.name} ya está instalado. ¿Reemplazarlo para el próximo arranque?`);
+    if (existente && !reemplazar) continue;
+    aviso.textContent = `cargando ${archivo.name}…`;
+    try {
+      const url = `/api/plugins/${encodeURIComponent(archivo.name)}` +
+        (reemplazar ? "?reemplazar=1" : "");
+      const respuesta = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/java-archive", "X-Setup2-Plugin-Upload": "1" },
+        body: archivo,
+      });
+      const datos = await respuesta.json();
+      if (!respuesta.ok) throw new Error(datos.error || `error ${respuesta.status}`);
+      aviso.textContent = `✓ ${datos.nombre} instalado; se cargará al próximo arranque`;
+      await refrescarPlugins();
+    } catch (error) {
+      aviso.textContent = `✗ ${archivo.name}: ${error.message}`;
+    }
+  }
+}
+
+$("btn-plugins").addEventListener("click", () => abrirPlugins($("sidebar-plugins").hidden));
+$("btn-cerrar-plugins").addEventListener("click", () => abrirPlugins(false));
+$("btn-elegir-plugins").addEventListener("click", () => $("archivos-plugins").click());
+$("archivos-plugins").addEventListener("change", (evento) => {
+  cargarPlugins(Array.from(evento.target.files));
+  evento.target.value = "";
+});
+const zonaPlugins = $("zona-plugins");
+zonaPlugins.addEventListener("dragover", (evento) => {
+  evento.preventDefault();
+  zonaPlugins.classList.add("arrastrando");
+});
+zonaPlugins.addEventListener("dragleave", (evento) => {
+  if (!zonaPlugins.contains(evento.relatedTarget)) zonaPlugins.classList.remove("arrastrando");
+});
+zonaPlugins.addEventListener("drop", (evento) => {
+  evento.preventDefault();
+  zonaPlugins.classList.remove("arrastrando");
+  cargarPlugins(Array.from(evento.dataTransfer.files));
+});
+document.addEventListener("keydown", (evento) => {
+  if (evento.key === "Escape" && !$("sidebar-plugins").hidden) abrirPlugins(false);
 });
 
 cargarTemas();

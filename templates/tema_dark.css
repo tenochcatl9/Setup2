@@ -1,0 +1,32 @@
+@import url("/tema/template_default.css");
+
+:root {
+  --fondo: #10131b;
+  --fondo-caja: #090c12;
+  --panel: #191e29;
+  --panel-alto: #242c3a;
+  --rojo: #4263eb;
+  --rojo-vivo: #91a7ff;
+  --rojo-oscuro: #303c59;
+  --borde: #35425f;
+  --texto: #e8edf7;
+  --texto-tenue: #9aa8c0;
+  --ambar: #ffd166;
+}
+
+.rejilla {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-areas:
+    "estado jugadores"
+    "acciones acciones"
+    "consola consola";
+}
+
+@media (max-width: 950px) {
+  .rejilla {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "estado" "jugadores" "acciones" "consola";
+  }
+}
+
+.consola-caja .linea:nth-child(even) { background: #111722; }

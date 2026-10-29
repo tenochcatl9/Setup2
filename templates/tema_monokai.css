@@ -1,0 +1,17 @@
+@import url("/tema/template_default.css");
+
+:root {
+  --fondo: #272822;
+  --fondo-caja: #1e1f1c;
+  --panel: #30312b;
+  --panel-alto: #3b3c35;
+  --rojo: #a6e22e;
+  --rojo-vivo: #f92672;
+  --rojo-oscuro: #55564b;
+  --borde: #55564b;
+  --texto: #f8f8f2;
+  --texto-tenue: #b6b6a8;
+  --ambar: #e6db74;
+}
+
+.consola-caja .linea:nth-child(even) { background: #252620; }

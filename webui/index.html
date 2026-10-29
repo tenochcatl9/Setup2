@@ -13,11 +13,32 @@
   <div class="cabecera-derecha">
     <span id="indicador" class="indicador muerto"></span>
     <span id="indicador-texto" class="indicador-texto">conectando…</span>
+    <button id="btn-plugins" class="mini" type="button" aria-expanded="false"
+            aria-controls="sidebar-plugins">plugins</button>
     <label class="tema">tema
       <select id="selector-tema"></select>
     </label>
   </div>
 </header>
+
+<aside id="sidebar-plugins" class="sidebar" aria-label="Plugins" hidden>
+  <div class="sidebar-cabecera">
+    <h2>plugins instalados</h2>
+    <button id="btn-cerrar-plugins" class="mini" type="button" aria-label="Cerrar plugins">cerrar</button>
+  </div>
+  <p class="tenue chico">Arrastra aquí archivos .jar de plugins. Se instalarán para el próximo arranque.</p>
+  <div id="zona-plugins" class="zona-plugins" tabindex="0">
+    <span>soltar archivos .jar aquí</span>
+    <button id="btn-elegir-plugins" class="mini" type="button">elegir archivos</button>
+    <input id="archivos-plugins" type="file" accept=".jar" multiple hidden>
+  </div>
+  <a id="btn-tienda-plugins" class="boton-tienda-plugins"
+     href="https://tenohost.pages.dev/plugins/" target="_blank" rel="noopener">
+    abrir tienda de plugins
+  </a>
+  <p id="aviso-plugins" class="aviso" aria-live="polite"></p>
+  <ul id="lista-plugins" class="lista-plugins"><li class="tenue">cargando…</li></ul>
+</aside>
 
 <main class="rejilla">
 
@@ -38,6 +59,10 @@
 
   <section class="panel" id="panel-acciones">
     <h2>acciones</h2>
+    <label class="memoria" for="memoria-maxima">RAM máxima al arrancar
+      <span class="memoria-control"><input id="memoria-maxima" type="number" min="1" max="128" step="1" value="8"> GB</span>
+      <span id="ram-info" class="tenue chico">RAM disponible: comprobando…</span>
+    </label>
     <div class="botones">
       <button id="btn-arrancar">arrancar servidor</button>
       <button id="btn-parar" class="critico">parar servidor + túnel</button>

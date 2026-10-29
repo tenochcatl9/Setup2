@@ -1,0 +1,26 @@
+@import url("/tema/template_default.css");
+
+:root {
+  --fondo: #eef1f5;
+  --fondo-caja: #ffffff;
+  --panel: #ffffff;
+  --panel-alto: #e5eaf2;
+  --rojo: #3158b8;
+  --rojo-vivo: #214ca8;
+  --rojo-oscuro: #b9c5da;
+  --borde: #c4cede;
+  --texto: #202938;
+  --texto-tenue: #59677a;
+  --ambar: #8a5a00;
+}
+
+.indicador.muerto { background: #8b95a5; }
+.consola-caja .linea:nth-child(even) { background: #f1f4f8; }
+.a30 { color: #536171; }
+.a31, .a91 { color: #b42332; }
+.a32, .a92 { color: #19733a; }
+.a33, .a93 { color: #8a5a00; }
+.a34, .a94 { color: #3158b8; }
+.a35, .a95 { color: #8c328f; }
+.a36, .a96 { color: #087c83; }
+.a37, .a97 { color: #202938; }

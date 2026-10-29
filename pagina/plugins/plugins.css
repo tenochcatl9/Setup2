@@ -1,0 +1,43 @@
+.nav-principal { margin-left: auto; }
+.cabecera .marca a { color: inherit; text-decoration: none; }
+.conectar {
+  display: grid;
+  gap: 7px;
+  margin-top: 20px;
+  color: var(--texto-tenue);
+}
+.conectar-fila {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.conectar input {
+  flex: 1 1 280px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--borde);
+  background: var(--fondo-caja);
+  color: var(--texto);
+  font: inherit;
+}
+.conectar input:focus { outline: 1px solid var(--rojo-vivo); }
+.estado-conexion { min-height: 1.5em; margin-top: 10px; color: var(--texto-tenue); }
+.catalogo { display: grid; gap: 18px; }
+.plugin-card {
+  display: grid;
+  grid-template-columns: 128px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+  padding: 20px;
+  border: 1px solid var(--borde);
+  background: var(--panel);
+}
+.plugin-card > img { width: 128px; height: 128px; }
+.plugin-etiqueta { color: var(--rojo-vivo); font-size: 13px; letter-spacing: 1px; }
+.plugin-contenido h2 { margin: 4px 0 8px; }
+.plugin-contenido ul { margin: 12px 0 18px; padding-left: 20px; }
+.plugin-contenido li { margin: 4px 0; }
+.instalar-plugin:disabled { opacity: .55; cursor: wait; }
+@media (max-width: 600px) {
+  .plugin-card { grid-template-columns: 1fr; }
+}

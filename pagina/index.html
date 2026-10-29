@@ -13,6 +13,7 @@
 <header class="cabecera">
   <div class="marca">Teno<span>Host</span></div>
   <div class="tagline">servidor de Minecraft · todo en un comando</div>
+  <nav class="nav-principal"><a class="boton secundario" href="/plugins/">Plugins propios</a></nav>
 </header>
 
 <main>
@@ -26,6 +27,7 @@
     <li><b>Túnel público</b>: una dirección para que entren tus amigos, con túnel de respaldo si el principal falla.</li>
     <li><b>Respaldos</b>: el mundo se empaqueta solo y los cambios se suben a Git.</li>
     <li><b>Página de control</b>: estado, consola y acciones desde el navegador, en localhost.</li>
+    <li><b>Plugins propios</b>: instala desde la tienda de TenoHost sin buscar ni subir archivos JAR.</li>
   </ul>
 </section>
 
@@ -33,14 +35,13 @@
   <h2>Cómo usarlo</h2>
   <ol class="pasos">
     <li>
-      <span class="titulo">1. Descarga el instalador (un solo archivo)</span>
-      <pre><code>curl -fsSLO https://tenohost.pages.dev/script/setup_mc.py</code></pre>
-      <p class="nota">¿Prefieres el código completo a la vista? Al final de la página tienes también el paquete en tar.gz.</p>
+      <span class="titulo">1. Descarga y ejecuta con un solo comando</span>
+      <pre><code>curl -fsSLo setup_mc.py https://tenohost.pages.dev/script/setup_mc.py &amp;&amp; python3 setup_mc.py</code></pre>
+      <p class="nota">El script descarga automáticamente el paquete completo y sus actualizaciones desde esta página. También puedes bajar el tar.gz al final.</p>
     </li>
     <li>
-      <span class="titulo">2. Arranca</span>
-      <pre><code>python3 setup_mc.py</code></pre>
-      <p class="nota">La primera vez se descarga solo el resto del script, y después la interfaz y los temas, desde esta misma página; además comprueba que tengas Python 3 y Java 21+.</p>
+      <span class="titulo">2. Configura y arranca</span>
+      <p>El instalador comprueba que tengas Python 3 y Java 21+, y podrás configurar la memoria del servidor desde la página de control antes de arrancarlo.</p>
     </li>
     <li>
       <span class="titulo">3. Juega</span>

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plugins propios — TenoHost</title>
+<meta name="description" content="Plugins propios para Paper, instalables directamente desde la interfaz local de setup2.">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../estilo.css">
+<link rel="stylesheet" href="plugins.css">
+</head>
+<body>
+<header class="cabecera">
+  <div class="marca"><a href="/" aria-label="Volver a TenoHost">Teno<span>Host</span></a></div>
+  <div class="tagline">plugins propios para tu servidor Paper</div>
+</header>
+
+<main>
+  <section class="bloque">
+    <h1>Plugins propios</h1>
+    <p>Instala un plugin en el servidor que controlas desde la UI local. La descarga se verifica antes de guardarse; no hace falta buscar ni subir un JAR.</p>
+    <label class="conectar" for="url-servidor">URL de la UI local del servidor
+      <span class="conectar-fila">
+        <input id="url-servidor" type="url" value="http://127.0.0.1:8080"
+               autocomplete="url" spellcheck="false">
+        <button id="btn-conectar" class="boton" type="button">Conectar</button>
+      </span>
+    </label>
+    <p class="nota">En Codespaces, usa la URL reenviada del puerto 8080 (pestaña PORTS). La instalación guarda el JAR para el próximo arranque; no detiene ni recarga el servidor actual.</p>
+    <p id="estado-conexion" class="estado-conexion" aria-live="polite">Conecta con la UI local para instalar.</p>
+  </section>
+
+  <section id="catalogo" class="catalogo" aria-label="Catálogo de plugins">
+    <article class="plugin-card" data-plugin="permadeath">
+      <img src="permadeath.svg" alt="" width="128" height="128">
+      <div class="plugin-contenido">
+        <p class="plugin-etiqueta">PLUGIN OFICIAL · 1.0.0</p>
+        <h2>Permadeath</h2>
+        <p>Al morir, el jugador queda temporalmente en espectador, recibe una cuenta atrás para revivir y conserva una copia completa de su inventario en cofres en el lugar de la muerte.</p>
+        <ul>
+          <li>Conserva los 36 slots, armadura y mano secundaria; crea cofres adicionales si hace falta.</li>
+          <li>Reproduce el trueno del tridente y anuncia la causa exacta de muerte en Discord.</li>
+          <li>Comandos de administración: <code>/permadeath on</code>, <code>/permadeath off</code> y <code>/permadeath time 2 hours</code>.</li>
+        </ul>
+        <button class="boton instalar-plugin" type="button">Instalar en mi servidor</button>
+      </div>
+    </article>
+  </section>
+</main>
+
+<footer class="pie">
+  <span><b>TenoHost</b> · <a href="/">volver a la página principal</a></span>
+  <span>Plugins instalados desde la UI local; requieren reiniciar el servidor para cargarse.</span>
+</footer>
+<script src="plugins.js" defer></script>
+</body>
+</html>
