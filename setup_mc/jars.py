@@ -316,39 +316,50 @@ def actualizar_plugins_propios() -> None:
             aviso(f"Se omitió la actualización de {nombre}: catálogo inválido.")
             continue
         try:
-            with zipfile.ZipFile(destino) as instalado:
-                manifiestos = {"plugin.yml", "paper-plugin.yml"} & set(instalado.namelist())
-                version_instalada = ""
-                if manifiestos:
-                    texto = instalado.read(sorted(manifiestos)[0]).decode("utf-8")
-                    encontrada = re.search(r"(?m)^version:\s*['\"]?([^'\"\s]+)", texto)
-                    version_instalada = encontrada.group(1) if encontrada else ""
+            version_instalada = ""
+            try:
+                with zipfile.ZipFile(destino) as instalado:
+                    manifiestos = {"plugin.yml", "paper-plugin.yml"} & set(instalado.namelist())
+                    if manifiestos:
+                        texto = instalado.read(sorted(manifiestos)[0]).decode("utf-8")
+                        encontrada = re.search(r"(?m)^version:\s*['\"]?([^'\"\s]+)", texto)
+                        version_instalada = encontrada.group(1) if encontrada else ""
+            except (zipfile.BadZipFile, UnicodeDecodeError):
+                pass
             version_publicada = str(plugin.get("version") or "")
             version_pattern = r"\d+(?:\.\d+)*"
-            if (not re.fullmatch(version_pattern, version_instalada)
-                    or not re.fullmatch(version_pattern, version_publicada)):
+            if not re.fullmatch(version_pattern, version_publicada):
                 raise RuntimeError("no se pudo leer una versión semántica del plugin.")
-            actual_parts = tuple(map(int, version_instalada.split(".")))
-            nueva_parts = tuple(map(int, version_publicada.split(".")))
-            longitud = max(len(actual_parts), len(nueva_parts))
-            actual_parts += (0,) * (longitud - len(actual_parts))
-            nueva_parts += (0,) * (longitud - len(nueva_parts))
-            if nueva_parts < actual_parts:
-                log(f"{nombre} local v{version_instalada} es más reciente que el catálogo "
-                    f"v{version_publicada}; no se reemplaza.")
-                continue
+            if re.fullmatch(version_pattern, version_instalada):
+                actual_parts = tuple(map(int, version_instalada.split(".")))
+                nueva_parts = tuple(map(int, version_publicada.split(".")))
+                longitud = max(len(actual_parts), len(nueva_parts))
+                actual_parts += (0,) * (longitud - len(actual_parts))
+                nueva_parts += (0,) * (longitud - len(nueva_parts))
+                if nueva_parts < actual_parts:
+                    log(f"{nombre} local v{version_instalada} es más reciente que el catálogo "
+                        f"v{version_publicada}; no se reemplaza.")
+                    continue
             actual = hashlib.sha256(destino.read_bytes()).hexdigest()
             if actual.lower() == digest.lower():
                 continue
-            descarga = requests.get(
-                f"{url.rstrip('/')}/plugins/{nombre}",
-                headers={"User-Agent": "setup-mc-plugin-updater"},
-                timeout=60,
-            )
-            descarga.raise_for_status()
-            datos = descarga.content
-            if not datos or len(datos) > 100 * 1024 * 1024:
-                raise RuntimeError("el JAR está vacío o supera los 100 MB.")
+            chunks = []
+            total = 0
+            with requests.get(
+                    f"{url.rstrip('/')}/plugins/{nombre}",
+                    headers={"User-Agent": "setup-mc-plugin-updater"},
+                    timeout=60, stream=True) as descarga:
+                descarga.raise_for_status()
+                for chunk in descarga.iter_content(64 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > 100 * 1024 * 1024:
+                        raise RuntimeError("el JAR supera los 100 MB.")
+                    chunks.append(chunk)
+            datos = b"".join(chunks)
+            if not datos:
+                raise RuntimeError("el JAR está vacío.")
             if hashlib.sha256(datos).hexdigest().lower() != digest.lower():
                 raise RuntimeError("el SHA-256 no coincide con el catálogo.")
             with zipfile.ZipFile(io.BytesIO(datos)) as jar:

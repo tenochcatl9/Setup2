@@ -8,20 +8,29 @@ import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Display;
+import org.bukkit.entity.AbstractArrow;
+import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.ItemDisplay;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.SmallFireball;
+import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.ProjectileHitEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.PrepareAnvilEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
-import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
+import org.bukkit.event.world.LootGenerateEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.inventory.meta.EnchantmentStorageMeta;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
@@ -35,16 +44,19 @@ import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
 import java.util.HashSet;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
     private final Set<UUID> displays = new HashSet<>();
-    private final Map<UUID, Long> dashCooldowns = new java.util.HashMap<>();
     private NamespacedKey shieldKey;
-    private NamespacedKey dashRuneKey;
+    private NamespacedKey hellRuneKey;
+    private NamespacedKey hellBookKey;
+    private NamespacedKey hellArrowKey;
     private NamespacedKey vxKey;
     private NamespacedKey vyKey;
     private NamespacedKey vzKey;
@@ -57,7 +69,9 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
     public void onEnable() {
         saveDefaultConfig();
         shieldKey = new NamespacedKey(this, "shield-drop");
-        dashRuneKey = new NamespacedKey(this, "dash-rune");
+        hellRuneKey = new NamespacedKey(this, "hell-rune");
+        hellBookKey = new NamespacedKey(this, "hell-rune-book");
+        hellArrowKey = new NamespacedKey(this, "hell-rune-arrow");
         vxKey = new NamespacedKey(this, "velocity-x");
         vyKey = new NamespacedKey(this, "velocity-y");
         vzKey = new NamespacedKey(this, "velocity-z");
@@ -87,10 +101,10 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
             sender.sendMessage("§cNo tienes permiso para dar esta espada.");
             return true;
         }
-        if ((args.length != 2 && args.length != 3)
+        if (args.length != 2 && args.length != 3
                 || !args[0].equalsIgnoreCase("give")
-                || args.length == 3 && !args[2].equalsIgnoreCase("dash")) {
-            sender.sendMessage("§eUsa: /combat give <jugador> [dash]");
+                || args.length == 3 && !args[2].equalsIgnoreCase("hell")) {
+            sender.sendMessage("§eUsa: /combat give <jugador> [hell]");
             return true;
         }
         Player target = Bukkit.getPlayerExact(args[1]);
@@ -98,12 +112,12 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
             sender.sendMessage("§cEse jugador no está conectado.");
             return true;
         }
-        ItemStack sword = createDashSword();
-        Map<Integer, ItemStack> remaining = target.getInventory().addItem(sword);
+        ItemStack book = createHellBook();
+        Map<Integer, ItemStack> remaining = target.getInventory().addItem(book);
         for (ItemStack item : remaining.values()) {
             target.getWorld().dropItemNaturally(target.getLocation(), item);
         }
-        sender.sendMessage("§aEspada con Dash entregada a " + target.getName() + ".");
+        sender.sendMessage("§aLibro de la runa Hell entregado a " + target.getName() + ".");
         return true;
     }
 
@@ -115,7 +129,7 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
             return matching(Bukkit.getOnlinePlayers().stream().map(Player::getName).toList(), args[1]);
         }
         if (args.length == 3 && args[0].equalsIgnoreCase("give")) {
-            return matching(List.of("dash"), args[2]);
+            return matching(List.of("hell"), args[2]);
         }
         return List.of();
     }
@@ -125,60 +139,135 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
                 .toList();
     }
 
-    private ItemStack createDashSword() {
-        ItemStack sword = new ItemStack(Material.NETHERITE_SWORD);
-        ItemMeta meta = sword.getItemMeta();
-        meta.displayName(Component.text("Espada de Combate", NamedTextColor.AQUA)
-                .decoration(TextDecoration.ITALIC, false));
+    private ItemStack createHellBook() {
+        ItemStack book = new ItemStack(Material.ENCHANTED_BOOK);
+        EnchantmentStorageMeta meta = (EnchantmentStorageMeta) book.getItemMeta();
+        meta.displayName(Component.text("Hell", NamedTextColor.LIGHT_PURPLE)
+                .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false));
         meta.lore(List.of(
-                Component.text("HABILIDAD", NamedTextColor.DARK_GRAY)
+                Component.text("RUNA DE ARCO", NamedTextColor.DARK_GRAY)
                         .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false),
-                Component.text("Dash la Runa", NamedTextColor.LIGHT_PURPLE)
+                Component.text("Hell", NamedTextColor.LIGHT_PURPLE)
                         .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false),
-                Component.text("Clic derecho para impulsarte como con Riptide.", NamedTextColor.GRAY)
+                Component.text("Aplícala a un arco en un yunque.", NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false),
+                Component.text("Las flechas invocan una espiral de fuego.", NamedTextColor.GRAY)
                         .decoration(TextDecoration.ITALIC, false)));
-        meta.getPersistentDataContainer().set(dashRuneKey, PersistentDataType.BYTE, (byte) 1);
-        sword.setItemMeta(meta);
-        return sword;
+        meta.setEnchantmentGlintOverride(true);
+        meta.getPersistentDataContainer().set(hellBookKey, PersistentDataType.BYTE, (byte) 1);
+        book.setItemMeta(meta);
+        return book;
+    }
+
+    private boolean isHellBook(ItemStack item) {
+        return item != null && item.getType() == Material.ENCHANTED_BOOK
+                && item.getItemMeta() != null
+                && item.getItemMeta().getPersistentDataContainer()
+                .has(hellBookKey, PersistentDataType.BYTE);
+    }
+
+    private boolean hasHellRune(ItemStack item) {
+        return item != null && item.getType() == Material.BOW && item.getItemMeta() != null
+                && item.getItemMeta().getPersistentDataContainer()
+                .has(hellRuneKey, PersistentDataType.BYTE);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPrepareAnvil(PrepareAnvilEvent event) {
+        ItemStack bow = event.getInventory().getItem(0);
+        ItemStack book = event.getInventory().getItem(1);
+        if (!isHellBook(book)) {
+            return;
+        }
+        if (bow == null || bow.getType() != Material.BOW || hasHellRune(bow)) {
+            event.setResult(null);
+            return;
+        }
+        ItemStack result = bow.clone();
+        ItemMeta meta = result.getItemMeta();
+        meta.getPersistentDataContainer().set(hellRuneKey, PersistentDataType.BYTE, (byte) 1);
+        List<Component> lore = new ArrayList<>(meta.lore() == null ? List.of() : meta.lore());
+        lore.add(Component.text("Hell", NamedTextColor.LIGHT_PURPLE)
+                .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false));
+        meta.lore(lore);
+        result.setItemMeta(meta);
+        event.setResult(result);
+        event.getInventory().setRepairCost(1);
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
-    public void onDashUse(PlayerInteractEvent event) {
-        if (event.getHand() != EquipmentSlot.HAND
-                || !event.getAction().isRightClick()
-                || !isDashSword(event.getItem())) {
+    public void onAnvilTake(InventoryClickEvent event) {
+        if (event.getRawSlot() != 2 || !isHellBook(event.getView().getItem(1))) {
             return;
         }
-        event.setCancelled(true);
-        Player player = event.getPlayer();
-        long now = getServer().getCurrentTick();
-        long availableAt = dashCooldowns.getOrDefault(player.getUniqueId(), 0L);
-        if (now < availableAt) {
+        if (event.getView().getItem(0) == null
+                || event.getView().getItem(0).getType() != Material.BOW
+                || !hasHellRune(event.getCurrentItem())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onHellBowShoot(EntityShootBowEvent event) {
+        if (!(event.getProjectile() instanceof AbstractArrow arrow) || !hasHellRune(event.getBow())) {
             return;
         }
-        dashCooldowns.put(player.getUniqueId(), now + getConfig().getLong("dash-cooldown-ticks", 40));
+        arrow.getPersistentDataContainer().set(hellArrowKey, PersistentDataType.BYTE, (byte) 1);
+    }
 
-        Vector direction = player.getLocation().getDirection().normalize();
-        Vector impulse = direction.multiply(getConfig().getDouble("dash-power", 2.5));
-        if (player.isOnGround()) {
-            impulse.setY(impulse.getY() + getConfig().getDouble("dash-ground-boost", 1.2));
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onHellArrowHit(ProjectileHitEvent event) {
+        if (!(event.getEntity() instanceof AbstractArrow arrow)
+                || !arrow.getPersistentDataContainer().has(hellArrowKey, PersistentDataType.BYTE)
+                || !(event.getHitEntity() instanceof LivingEntity victim)
+                || victim.isDead()) {
+            return;
         }
-        player.setVelocity(player.getVelocity().add(impulse));
-        player.setFallDistance(0);
-        player.getWorld().playSound(player.getLocation(),
-                org.bukkit.Sound.ITEM_TRIDENT_RIPTIDE_3, 1.0f, 1.0f);
+        Player shooter = arrow.getShooter() instanceof Player player ? player : null;
+        int count = Math.max(1, Math.min(24, getConfig().getInt("hell-fireball-count", 10)));
+        double radius = Math.max(1.0, Math.min(8.0,
+                getConfig().getDouble("hell-spiral-radius", 3.5)));
+        long interval = Math.max(1L, getConfig().getLong("hell-fireball-interval-ticks", 2L));
+        for (int index = 0; index < count; index++) {
+            int step = index;
+            getServer().getScheduler().runTaskLater(this, () -> {
+                if (!victim.isValid() || victim.isDead()) {
+                    return;
+                }
+                Location center = victim.getLocation().add(0, victim.getHeight() * 0.5, 0);
+                double angle = step * (Math.PI * 2.0 / 5.0);
+                double height = Math.sin(step * 0.65) * 1.2;
+                Location launch = center.clone().add(
+                        Math.cos(angle) * radius, height, Math.sin(angle) * radius);
+                Vector direction = center.toVector().subtract(launch.toVector()).normalize();
+                SmallFireball fireball = victim.getWorld().spawn(launch, SmallFireball.class, entity -> {
+                    entity.setShooter(shooter);
+                    entity.setDirection(direction);
+                    entity.setIsIncendiary(false);
+                    entity.setYield(0.0f);
+                    entity.setVelocity(direction.multiply(getConfig().getDouble(
+                            "hell-fireball-speed", 0.75)));
+                });
+            }, step * interval);
+        }
+        arrow.remove();
     }
 
-    @EventHandler
-    public void onQuit(PlayerQuitEvent event) {
-        dashCooldowns.remove(event.getPlayer().getUniqueId());
-    }
-
-    private boolean isDashSword(ItemStack item) {
-        return item != null && item.getType().name().endsWith("_SWORD")
-                && item.getItemMeta() != null
-                && item.getItemMeta().getPersistentDataContainer()
-                .has(dashRuneKey, PersistentDataType.BYTE);
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onStructureLoot(LootGenerateEvent event) {
+        if (!getConfig().getBoolean("hell-books-in-structures", true)) {
+            return;
+        }
+        String path = event.getLootTable().getKey().getKey();
+        if (!"minecraft".equals(event.getLootTable().getKey().getNamespace())
+                || !path.startsWith("chests/")
+                || ThreadLocalRandom.current().nextDouble()
+                >= getConfig().getDouble("hell-book-structure-chance", 0.12)) {
+            return;
+        }
+        List<ItemStack> loot = new ArrayList<>(event.getLoot());
+        loot.add(createHellBook());
+        event.setLoot(loot);
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)

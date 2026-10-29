@@ -25,7 +25,9 @@ python3 setup_mc.py
   de la UI o `--actualizar-paper`) y conserva el mundo y a los jugadores.
 - **Plugins**: ViaVersion + ViaBackwards (compatibilidad de versiones), AuthMe
   (registro/login adaptado a túnel) y SkinsRestorer. La lista puede venir del
-  panel sin tocar el código.
+  panel sin tocar el código. Permadeath y Combat Basics verifican su catálogo
+  HTTPS y SHA-256 antes de cada arranque; si hay una versión nueva, la descargan
+  antes de iniciar Paper y la cargan en ese arranque.
 - **Túnel público**: Asyx con Pinggy de respaldo; barra de progreso y avisos a
   Discord, incluida la dirección final.
 - **Respaldos**: comprime el mundo y la instalación (con `setup_mc.py` dentro)
