@@ -1,0 +1,6 @@
+enabled: true
+pickup-delay-ticks: 10
+launch-horizontal: 0.28
+launch-vertical: 0.34
+gravity-per-tick: 0.04
+bounce-damping: 0.55

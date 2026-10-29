@@ -4,3 +4,6 @@ launch-horizontal: 0.28
 launch-vertical: 0.34
 gravity-per-tick: 0.04
 bounce-damping: 0.55
+dash-power: 2.5
+dash-ground-boost: 1.2
+dash-cooldown-ticks: 40

@@ -3,8 +3,11 @@ package dev.tenohost.combatbasics;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Display;
 import org.bukkit.entity.ItemDisplay;
 import org.bukkit.entity.Player;
@@ -12,27 +15,36 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
+import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.bukkit.NamespacedKey;
 import org.bukkit.util.Transformation;
 import org.bukkit.util.Vector;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
 public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
     private final Set<UUID> displays = new HashSet<>();
+    private final Map<UUID, Long> dashCooldowns = new java.util.HashMap<>();
     private NamespacedKey shieldKey;
+    private NamespacedKey dashRuneKey;
     private NamespacedKey vxKey;
     private NamespacedKey vyKey;
     private NamespacedKey vzKey;
@@ -45,6 +57,7 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
     public void onEnable() {
         saveDefaultConfig();
         shieldKey = new NamespacedKey(this, "shield-drop");
+        dashRuneKey = new NamespacedKey(this, "dash-rune");
         vxKey = new NamespacedKey(this, "velocity-x");
         vyKey = new NamespacedKey(this, "velocity-y");
         vzKey = new NamespacedKey(this, "velocity-z");
@@ -60,6 +73,112 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
                     .forEach(displays::add);
         }
         getServer().getScheduler().runTaskTimer(this, this::tickDisplays, 1L, 1L);
+        var command = getCommand("combatbasics");
+        if (command == null) {
+            throw new IllegalStateException("Falta registrar /combat en plugin.yml");
+        }
+        command.setExecutor(this::onCommand);
+        command.setTabCompleter((sender, ignored, alias, args) -> tabComplete(sender, args));
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!sender.hasPermission("combatbasics.give")) {
+            sender.sendMessage("§cNo tienes permiso para dar esta espada.");
+            return true;
+        }
+        if ((args.length != 2 && args.length != 3)
+                || !args[0].equalsIgnoreCase("give")
+                || args.length == 3 && !args[2].equalsIgnoreCase("dash")) {
+            sender.sendMessage("§eUsa: /combat give <jugador> [dash]");
+            return true;
+        }
+        Player target = Bukkit.getPlayerExact(args[1]);
+        if (target == null) {
+            sender.sendMessage("§cEse jugador no está conectado.");
+            return true;
+        }
+        ItemStack sword = createDashSword();
+        Map<Integer, ItemStack> remaining = target.getInventory().addItem(sword);
+        for (ItemStack item : remaining.values()) {
+            target.getWorld().dropItemNaturally(target.getLocation(), item);
+        }
+        sender.sendMessage("§aEspada con Dash entregada a " + target.getName() + ".");
+        return true;
+    }
+
+    private List<String> tabComplete(CommandSender sender, String[] args) {
+        if (args.length == 1) {
+            return matching(List.of("give"), args[0]);
+        }
+        if (args.length == 2 && args[0].equalsIgnoreCase("give")) {
+            return matching(Bukkit.getOnlinePlayers().stream().map(Player::getName).toList(), args[1]);
+        }
+        if (args.length == 3 && args[0].equalsIgnoreCase("give")) {
+            return matching(List.of("dash"), args[2]);
+        }
+        return List.of();
+    }
+
+    private List<String> matching(List<String> values, String prefix) {
+        return values.stream().filter(value -> value.regionMatches(true, 0, prefix, 0, prefix.length()))
+                .toList();
+    }
+
+    private ItemStack createDashSword() {
+        ItemStack sword = new ItemStack(Material.NETHERITE_SWORD);
+        ItemMeta meta = sword.getItemMeta();
+        meta.displayName(Component.text("Espada de Combate", NamedTextColor.AQUA)
+                .decoration(TextDecoration.ITALIC, false));
+        meta.lore(List.of(
+                Component.text("HABILIDAD", NamedTextColor.DARK_GRAY)
+                        .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false),
+                Component.text("Dash la Runa", NamedTextColor.LIGHT_PURPLE)
+                        .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false),
+                Component.text("Clic derecho para impulsarte como con Riptide.", NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false)));
+        meta.getPersistentDataContainer().set(dashRuneKey, PersistentDataType.BYTE, (byte) 1);
+        sword.setItemMeta(meta);
+        return sword;
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onDashUse(PlayerInteractEvent event) {
+        if (event.getHand() != EquipmentSlot.HAND
+                || !event.getAction().isRightClick()
+                || !isDashSword(event.getItem())) {
+            return;
+        }
+        event.setCancelled(true);
+        Player player = event.getPlayer();
+        long now = getServer().getCurrentTick();
+        long availableAt = dashCooldowns.getOrDefault(player.getUniqueId(), 0L);
+        if (now < availableAt) {
+            return;
+        }
+        dashCooldowns.put(player.getUniqueId(), now + getConfig().getLong("dash-cooldown-ticks", 40));
+
+        Vector direction = player.getLocation().getDirection().normalize();
+        Vector impulse = direction.multiply(getConfig().getDouble("dash-power", 2.5));
+        if (player.isOnGround()) {
+            impulse.setY(impulse.getY() + getConfig().getDouble("dash-ground-boost", 1.2));
+        }
+        player.setVelocity(player.getVelocity().add(impulse));
+        player.setFallDistance(0);
+        player.getWorld().playSound(player.getLocation(),
+                org.bukkit.Sound.ITEM_TRIDENT_RIPTIDE_3, 1.0f, 1.0f);
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        dashCooldowns.remove(event.getPlayer().getUniqueId());
+    }
+
+    private boolean isDashSword(ItemStack item) {
+        return item != null && item.getType().name().endsWith("_SWORD")
+                && item.getItemMeta() != null
+                && item.getItemMeta().getPersistentDataContainer()
+                .has(dashRuneKey, PersistentDataType.BYTE);
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)

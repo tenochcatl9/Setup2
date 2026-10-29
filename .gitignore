@@ -36,7 +36,7 @@ logs/
 plugins/
 !pagina/plugins/
 !pagina/plugins/**
-plugins-src/*/target/
+plugins-src/permadeath/target/
 libraries/
 cache/
 versions/
@@ -89,6 +89,7 @@ env/
 .wrangler
 .dev.vars*
 !.dev.vars.example
+
 
 
 

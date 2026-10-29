@@ -24,8 +24,9 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
-import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.event.player.PlayerLoginEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -42,10 +43,10 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
@@ -58,7 +59,7 @@ public final class PermadeathPlugin extends JavaPlugin
     private static final PlainTextComponentSerializer PLAIN =
             PlainTextComponentSerializer.plainText();
 
-    private final Map<UUID, DeathRecord> deaths = new HashMap<>();
+    private final Map<UUID, DeathRecord> deaths = new ConcurrentHashMap<>();
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5)).build();
     private YamlConfiguration deathData;
@@ -112,32 +113,47 @@ public final class PermadeathPlugin extends JavaPlugin
         deaths.put(player.getUniqueId(), record);
         saveDeath(player.getUniqueId(), record);
         Bukkit.getBanList(BanList.Type.NAME).addBan(
-                player.getName(), cause, new Date(expiresAt), "Permadeath");
+                player.getName(), banMessage(cause, expiresAt), new Date(expiresAt), "Permadeath");
 
         player.getWorld().playSound(deathLocation, Sound.ITEM_TRIDENT_THUNDER, 1.0f, 2.0f);
         player.getWorld().playSound(deathLocation, Sound.ITEM_TRIDENT_THUNDER, 1.0f, 0.0f);
         sendDeathWebhook(player.getName(), cause, deathLocation, expiresAt);
+        Bukkit.getScheduler().runTask(this, () -> {
+            Player online = Bukkit.getPlayer(player.getUniqueId());
+            if (online != null && online.isOnline()) {
+                online.kickPlayer(banMessage(cause, expiresAt));
+            }
+        });
         getLogger().info("Permadeath: " + player.getName() + " murió: " + cause);
     }
 
-    @EventHandler
-    public void onRespawn(PlayerRespawnEvent event) {
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onLogin(PlayerLoginEvent event) {
         DeathRecord record = deaths.get(event.getPlayer().getUniqueId());
-        if (record == null || record.expiresAt() <= System.currentTimeMillis()) {
+        if (record == null) {
             return;
         }
-        event.setRespawnLocation(record.location().clone());
-        Bukkit.getScheduler().runTask(this, () -> {
-            Player player = event.getPlayer();
-            DeathRecord current = deaths.get(player.getUniqueId());
-            if (current != null && current.expiresAt() > System.currentTimeMillis()) {
-                clearInventory(player.getInventory());
-                player.setGameMode(GameMode.SPECTATOR);
-                player.sendMessage(Component.text(
-                        "§cHas muerto. Motivo del baneo: §f" + current.reason()));
-                updateCountdown(player, current);
+        if (record.expiresAt() <= System.currentTimeMillis()) {
+            var ban = Bukkit.getBanList(BanList.Type.NAME).getBanEntry(record.name());
+            if (ban != null && "Permadeath".equalsIgnoreCase(ban.getSource())) {
+                pardon(record.name());
+                if (event.getResult() == PlayerLoginEvent.Result.KICK_BANNED) {
+                    event.allow();
+                }
             }
-        });
+            return;
+        }
+        event.disallow(PlayerLoginEvent.Result.KICK_BANNED,
+                banMessage(record.reason(), record.expiresAt()));
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onAsyncLogin(AsyncPlayerPreLoginEvent event) {
+        DeathRecord record = deaths.get(event.getUniqueId());
+        if (record != null && record.expiresAt() > System.currentTimeMillis()) {
+            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED,
+                    banMessage(record.reason(), record.expiresAt()));
+        }
     }
 
     @EventHandler
@@ -148,21 +164,15 @@ public final class PermadeathPlugin extends JavaPlugin
             return;
         }
         if (record.expiresAt() <= System.currentTimeMillis()) {
-            revive(player, record);
+            Bukkit.getScheduler().runTask(this, () -> {
+                DeathRecord current = deaths.get(player.getUniqueId());
+                if (current != null && current.expiresAt() <= System.currentTimeMillis()) {
+                    revive(player, current);
+                }
+            });
             return;
         }
-        Bukkit.getScheduler().runTask(this, () -> {
-            DeathRecord current = deaths.get(player.getUniqueId());
-            if (current == null || current.expiresAt() <= System.currentTimeMillis()) {
-                return;
-            }
-            clearInventory(player.getInventory());
-            player.setGameMode(GameMode.SPECTATOR);
-            player.teleport(current.location());
-            player.sendMessage(Component.text(
-                    "§cSigues en permadeath. Motivo del baneo: §f" + current.reason()));
-            updateCountdown(player, current);
-        });
+        player.kickPlayer(banMessage(record.reason(), record.expiresAt()));
     }
 
     @Override
@@ -345,13 +355,22 @@ public final class PermadeathPlugin extends JavaPlugin
                 Math.max(0, (record.expiresAt() - System.currentTimeMillis() + 999) / 1000))));
     }
 
+    private String banMessage(String reason, long expiresAt) {
+        long remaining = Math.max(0, (expiresAt - System.currentTimeMillis() + 999) / 1000);
+        return reason + "\n§cTiempo restante para revivir: §f" + formatDuration(remaining);
+    }
+
     private void revive(Player player, DeathRecord record) {
         pardon(record.name());
         deaths.remove(player.getUniqueId());
         deathData.set(player.getUniqueId().toString(), null);
         saveDeaths();
         player.setGameMode(GameMode.SURVIVAL);
-        Location location = findSafeReviveLocation(record.location());
+        Location spawn = player.getBedSpawnLocation();
+        if (spawn == null || spawn.getWorld() == null) {
+            spawn = Bukkit.getWorlds().getFirst().getSpawnLocation();
+        }
+        Location location = findSafeReviveLocation(spawn);
         player.teleport(location);
         player.sendMessage(Component.text("§a¡Has revivido!"));
     }

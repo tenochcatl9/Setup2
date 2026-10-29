@@ -1,5 +1,5 @@
 name: Permadeath
-version: 1.0.0
+version: 1.1.0
 main: dev.tenohost.permadeath.PermadeathPlugin
 api-version: '26.3'
 description: Permadeath con espectador temporal, cofres de objetos y avisos en Discord.

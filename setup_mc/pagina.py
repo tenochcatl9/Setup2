@@ -209,7 +209,7 @@ def construir_sitio(destino: Path, version: str, changelog: str = "") -> dict:
         plugins.append({
             "id": plugin_id,
             "nombre": nombre,
-            "version": "1.0.0",
+            "version": "1.1.0",
             "descripcion": descripcion,
             "archivo": nombre_jar,
             "sha256": hashlib.sha256(jar_bytes).hexdigest(),
