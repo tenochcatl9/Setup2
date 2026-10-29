@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Combat Basics</title>
+  <rect width="128" height="128" fill="#071510"/>
+  <path d="M64 10 110 34v60l-46 24-46-24V34z" fill="#0b2117" stroke="#52d68b" stroke-width="4"/>
+  <path d="M64 29 94 44v38L64 98 34 82V44z" fill="#101d15" stroke="#b3f4c8" stroke-width="3"/>
+  <path d="m43 53 38 25M49 44l38 25" stroke="#52d68b" stroke-width="7" stroke-linecap="round"/>
+  <path d="m62 44 14-9 12 4-5 14-15 10zM34 75l15 9-4 14-13-5z" fill="#c6a86a" stroke="#f4dfaa" stroke-width="2"/>
+  <circle cx="92" cy="37" r="4" fill="#fff1b3"/>
+</svg>

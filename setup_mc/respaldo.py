@@ -14,8 +14,8 @@ from .avisos import enviar_a_discord, obtener_webhook
 # Rutas que se empaquetan (relativas a SERVER_DIR); el resto se regenera al importar.
 # Lo que se versiona en git: plugins, configuración, datos de Paper y el propio
 # setup_mc.py (el .py suelto, que se completa solo). Entra en ~20 MB, así que el
-# repositorio lo aguanta siempre. El mundo, que ya no cabe, va aparte a la
-# release.
+# repositorio lo aguanta siempre. El mundo va aparte a Releases al superar el
+# límite de archivo o el umbral de tamaño del historial Git.
 BACKUP_INCLUYE_INSTALACION = ["plugins", "config", ".paper", "server.properties",
                               "bukkit.yml", "spigot.yml", "eula.txt", "setup_mc.py"]
 
@@ -45,8 +45,8 @@ TAMANO_ADVERTENCIA = 50 * 1024 * 1024
 
 TAMANO_MAXIMO = 100 * 1024 * 1024
 
-# Techo del repositorio: cada copia del respaldo queda en el historial para
-# siempre, así que sin un límite .git crece ~70 MB en cada ejecución.
+# A partir de este tamaño, los respaldos del mundo se guardan en una release
+# rodante para que .git no siga creciendo con cada actualización.
 GIT_AVISO = 600 * 1024 * 1024
 
 GIT_TECHO = 1024 * 1024 * 1024
@@ -72,29 +72,22 @@ def _tamano_git() -> int:
 def _mb(bytes_: int) -> str:
     return f"{bytes_ / 1048576:,.0f} MB"
 
-def decidir_jar_del_respaldo(con_jar: bool) -> tuple:
+def decidir_jar_del_respaldo(con_jar: bool, tam_git: int | None = None) -> tuple:
     """Decide si el respaldo incluye server.jar según el tamaño de .git.
 
-    Devuelve (incluir_jar, motivo). El server.jar son ~62 MB del paquete y es
-    lo único que infla el historial, así que en cuanto el repositorio se
-    acerca al techo se pasa automáticamente al respaldo pequeño (~7 MB).
+    Devuelve (incluir_jar, motivo). Al alcanzar el umbral Git, incluso los
+    respaldos pequeños pasan a Releases para no seguir creciendo el historial.
     """
     if not con_jar:
         return False, "pedido explícitamente con --respaldo-sin-jar"
-    tam = _tamano_git()
+    tam = _tamano_git() if tam_git is None else tam_git
     if tam == 0:
         return True, ""
-    if tam >= GIT_TECHO:
-        aviso(f".git ocupa {_mb(tam)} y el techo es {_mb(GIT_TECHO)}.")
-        log("    No se vuelve a subir el respaldo: el repositorio se saturaría.")
-        log("    Para desbloquearlo, quita blobs antiguos del historial (git filter-repo")
-        log("    / BFG) o vuelve a empezar el repo; o usa --sin-respaldo mientras tanto.")
-        return False, f".git ya está en el techo ({_mb(tam)})"
     if tam >= GIT_AVISO:
-        aviso(f".git ocupa {_mb(tam)}: se hace el respaldo SIN server.jar "
-              f"({_mb(TAMANO_MAXIMO // 10)}) para no engordarlo más.")
-        log(f"    Se avisa a partir de {_mb(GIT_AVISO)} y se bloquea a "
-            f"{_mb(GIT_TECHO)}. GitHub empieza a frenar pushes sobre 1 GB.")
+        aviso(f".git ocupa {_mb(tam)}: el respaldo del mundo se publicará "
+              "en la release rodante, fuera del historial Git.")
+        log(f"    A partir de {_mb(GIT_AVISO)} los respaldos dejan de añadirse "
+            f"a Git (techo recomendado: {_mb(GIT_TECHO)}).")
         return False, f".git grande ({_mb(tam)})"
     return True, ""
 
@@ -104,7 +97,8 @@ def _leer_estado_respaldo() -> dict:
     except (OSError, ValueError):
         return {}
 
-def _guardar_estado_respaldo(hash_contenido: str, alias: str = ""):
+def _guardar_estado_respaldo(hash_contenido: str, alias: str = "",
+                             en_release: bool = False):
     """Apunta el contenido del respaldo subido.
 
     `alias` guarda el hash de la lista de archivos que se probó antes de
@@ -116,6 +110,7 @@ def _guardar_estado_respaldo(hash_contenido: str, alias: str = ""):
         "contenido_sha256": hash_contenido,
         "cuando": time.strftime("%Y-%m-%d %H:%M:%S"),
         "version": "servidor-mc.tar.zst",
+        "en_release": en_release,
     }
     if alias and alias != hash_contenido:
         datos["contenido_sha256_previo"] = alias
@@ -136,6 +131,11 @@ def _respaldo_sigue_vigente(hash_contenido: str) -> bool:
         return False
     rel = _relativo(_paquete_respaldo())
     return _git(["ls-files", "--error-unmatch", rel]).returncode == 0
+
+def _respaldo_en_release_sigue_vigente(hash_contenido: str) -> bool:
+    estado = _leer_estado_respaldo()
+    conocidos = {estado.get("contenido_sha256"), estado.get("contenido_sha256_previo")}
+    return bool(estado.get("en_release") and hash_contenido in conocidos - {None, ""})
 
 RE_RAW = re.compile(r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(.+)$", re.I)
 
@@ -679,13 +679,21 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
     if not (SERVER_DIR / "world").is_dir():
         aviso("No hay mundo guardado: se omite el respaldo.")
         return False
-    con_jar, motivo_jar = decidir_jar_del_respaldo(con_jar)
+    tam_git = _tamano_git()
+    usar_release = tam_git >= GIT_AVISO
+    con_jar, motivo_jar = decidir_jar_del_respaldo(con_jar, tam_git)
     incluir = [p for p in BACKUP_INCLUYE if con_jar or p != "server.jar"]
     archivos, hash_contenido = _hash_contenido(SERVER_DIR, incluir)
     hash_inicial = hash_contenido
     if motivo_jar and not con_jar:
         log(f"    Motivo: {motivo_jar}.")
     RESPALDO_ACTUAL = _paquete_respaldo()
+    if not forzar and usar_release and _respaldo_en_release_sigue_vigente(hash_contenido):
+        ok("El mundo no ha cambiado desde su último respaldo en Releases.")
+        if not _instalacion_al_dia():
+            log("El respaldo de instalación no lleva el script actual: se regenera.")
+            crear_respaldo_instalacion()
+        return True
     if not forzar and _respaldo_sigue_vigente(hash_contenido):
         ok("El mundo no ha cambiado: se conserva el respaldo ya subido "
            "(no se suman ~70 MB al repositorio).")
@@ -695,6 +703,17 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
         if not _instalacion_al_dia():
             log("El respaldo de instalación no lleva el script actual: se regenera.")
             crear_respaldo_instalacion()
+        if usar_release:
+            _en_release(True)
+            try:
+                enlace = publicar_mundo(RESPALDO_ACTUAL)
+            except (RuntimeError, requests.RequestException) as e:
+                error(f"No se pudo migrar el mundo a Releases: {e}")
+                log("    El archivo queda local y fuera del historial Git.")
+                return False
+            ok(f"Respaldo existente migrado a Releases: {enlace}")
+            _guardar_estado_respaldo(hash_contenido, hash_inicial, en_release=True)
+            RESPALDO_ACTUAL = None
         return True
     manifiesto = {
         "creado": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -750,24 +769,29 @@ def crear_respaldo(con_jar: bool = True, forzar: bool = False) -> bool:
         aviso(f"El respaldo pesa {tam / 1048576:,.0f} MB. GitHub avisa a partir de "
               f"{TAMANO_ADVERTENCIA // 1048576} MB; por encima de "
               f"{TAMANO_MAXIMO // 1048576} MB ya no se puede subir.")
-    if tam > TAMANO_MAXIMO:
-        # El mundo ya no cabe en git. Se va a una release rodante con URL fija
-        # en vez de dejar de respaldar, y se deja de versionar para que .git
-        # no siga engordando con el mundo.
-        aviso(f"El respaldo llega a {tam / 1048576:,.0f} MB y GitHub no acepta "
-              f"blobs de más de {TAMANO_MAXIMO // 1048576} MB: se publica como "
-              "release en lugar de subirse al repositorio.")
+    if tam > TAMANO_MAXIMO or usar_release:
+        # La release rodante reemplaza su asset anterior y evita acumular
+        # respaldos nuevos en el historial Git al alcanzar el umbral.
+        if usar_release and tam <= TAMANO_MAXIMO:
+            aviso(f".git alcanzó el umbral de {_mb(GIT_AVISO)}: "
+                  "el respaldo se guarda fuera del historial Git.")
+        else:
+            aviso(f"El respaldo pesa {tam / 1048576:,.0f} MB y se publicará "
+                  "en Releases en vez de añadirse al repositorio.")
+        _en_release(True)
+        if tam > TAMANO_MAXIMO:
+            aviso(f"El respaldo llega a {tam / 1048576:,.0f} MB y GitHub no acepta "
+                  f"blobs de más de {TAMANO_MAXIMO // 1048576} MB.")
         try:
             enlace = publicar_mundo(RESPALDO_ACTUAL)
         except (RuntimeError, requests.RequestException) as e:
-            RESPALDO_ACTUAL.unlink(missing_ok=True)
-            error(f"No se pudo publicar el mundo en la release: {e}")
-            log("    Se deja el respaldo solo en disco, en respaldo/.")
+            error(f"No se pudo publicar el mundo en Releases: {e}")
+            log("    Se conserva el respaldo local, fuera del historial Git.")
             return False
-        _en_release(True)
         ok(f"Mundo publicado en la release: {enlace}")
         log("    Esa URL no cambia: siempre da el mundo más reciente, y el")
         log("    import la baja automáticamente si el repositorio no lo trae.")
+        _guardar_estado_respaldo(hash_contenido, hash_inicial, en_release=True)
         RESPALDO_ACTUAL = None
         return True
     crear_respaldo_instalacion()

@@ -18,16 +18,16 @@
 <main>
   <section class="bloque">
     <h1>Plugins propios</h1>
-    <p>Instala un plugin en el servidor que controlas desde la UI local. La descarga se verifica antes de guardarse; no hace falta buscar ni subir un JAR.</p>
+    <p>Instala nuestros plugins desde la UI local, o descarga sus JAR para subirlos manualmente. El navegador no se conecta directamente al servidor, así se evitan errores de CORS y de seguridad de Codespaces.</p>
     <label class="conectar" for="url-servidor">URL de la UI local del servidor
       <span class="conectar-fila">
         <input id="url-servidor" type="url" value="http://127.0.0.1:8080"
                autocomplete="url" spellcheck="false">
-        <button id="btn-conectar" class="boton" type="button">Conectar</button>
+        <button id="btn-conectar" class="boton" type="button">Abrir UI de plugins</button>
       </span>
     </label>
-    <p class="nota">En Codespaces, usa la URL reenviada del puerto 8080 (pestaña PORTS). La instalación guarda el JAR para el próximo arranque; no detiene ni recarga el servidor actual.</p>
-    <p id="estado-conexion" class="estado-conexion" aria-live="polite">Conecta con la UI local para instalar.</p>
+    <p class="nota">En Codespaces, usa la URL reenviada del puerto 8080 (pestaña PORTS). En la UI, abre «plugins» y pulsa instalar para el plugin deseado. También puedes subir el JAR descargado desde esa sección. Se cargan en el próximo arranque.</p>
+    <p id="estado-conexion" class="estado-conexion" aria-live="polite">Abre la UI para instalar con un clic o descarga el JAR.</p>
   </section>
 
   <section id="catalogo" class="catalogo" aria-label="Catálogo de plugins">
@@ -42,7 +42,27 @@
           <li>Reproduce el trueno del tridente y anuncia la causa exacta de muerte en Discord.</li>
           <li>Comandos de administración: <code>/permadeath on</code>, <code>/permadeath off</code> y <code>/permadeath time 2 hours</code>.</li>
         </ul>
-        <button class="boton instalar-plugin" type="button">Instalar en mi servidor</button>
+        <div class="acciones-plugin">
+          <button class="boton instalar-plugin" type="button">Instalar en mi servidor</button>
+          <a class="boton descargar-plugin" href="Permadeath.jar" download="Permadeath.jar">Descargar .jar</a>
+        </div>
+      </div>
+    </article>
+    <article class="plugin-card" data-plugin="combat-basics">
+      <img src="combat-basics.svg" alt="" width="128" height="128">
+      <div class="plugin-contenido">
+        <p class="plugin-etiqueta">PLUGIN OFICIAL · 1.0.0</p>
+        <h2>Combat Basics</h2>
+        <p>Si golpeas con cualquier azada a un jugador que está bloqueando con su escudo y te tiene delante, el escudo sale despedido como un ItemDisplay.</p>
+        <ul>
+          <li>Física propia: gravedad, rotación y rebote contra bloques.</li>
+          <li>Se recoge automáticamente al acercarse después del breve rebote; conserva el estado del escudo.</li>
+          <li>El golpe y el daño normales siguen aplicándose; el efecto solo desarma si el objetivo está bloqueando de frente.</li>
+        </ul>
+        <div class="acciones-plugin">
+          <button class="boton instalar-plugin" type="button">Instalar en mi servidor</button>
+          <a class="boton descargar-plugin" href="CombatBasics.jar" download="CombatBasics.jar">Descargar .jar</a>
+        </div>
       </div>
     </article>
   </section>

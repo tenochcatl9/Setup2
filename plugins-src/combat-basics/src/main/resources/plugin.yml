@@ -1,0 +1,5 @@
+name: CombatBasics
+version: 1.0.0
+main: dev.tenohost.combatbasics.CombatBasicsPlugin
+api-version: '26.3'
+description: Desarma escudos bloqueados con ataques de azada y los expulsa con física.

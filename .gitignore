@@ -36,7 +36,7 @@ logs/
 plugins/
 !pagina/plugins/
 !pagina/plugins/**
-plugins-src/permadeath/target/
+plugins-src/*/target/
 libraries/
 cache/
 versions/

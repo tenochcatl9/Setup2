@@ -175,42 +175,47 @@ def construir_sitio(destino: Path, version: str, changelog: str = "") -> dict:
     (destino / "ui" / "indice.json").write_text(
         json.dumps(indice, ensure_ascii=False, indent=2) + "\n")
 
-    plugin_dir = BASE_DIR / "plugins-src" / "permadeath"
     mvn = shutil.which("mvn")
     if not mvn:
-        raise RuntimeError("Página: hace falta Maven para compilar el plugin Permadeath.")
-    try:
-        compilacion = subprocess.run(
-            [mvn, "-q", "-f", str(plugin_dir / "pom.xml"), "package"],
-            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=300,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"Página: no se pudo compilar Permadeath: {exc}") from exc
-    if compilacion.returncode != 0:
-        detalle = (compilacion.stderr or compilacion.stdout).strip()[-1200:]
-        raise RuntimeError(f"Página: falló la compilación de Permadeath:\n{detalle}")
-    jar = plugin_dir / "target" / "Permadeath.jar"
-    if not jar.is_file():
-        raise RuntimeError("Página: Maven terminó, pero no generó Permadeath.jar.")
-    jar_bytes = jar.read_bytes()
-    plugin_destino = destino / "plugins" / "Permadeath.jar"
-    plugin_destino.parent.mkdir(parents=True, exist_ok=True)
-    plugin_destino.write_bytes(jar_bytes)
-    manifest_plugins = {
-        "version": version,
-        "plugins": [{
-            "id": "permadeath",
-            "nombre": "Permadeath",
+        raise RuntimeError("Página: hace falta Maven para compilar los plugins.")
+    definiciones = [
+        ("permadeath", "Permadeath", "Muerte temporal en espectador, "
+         "recuperación del inventario y avisos en Discord."),
+        ("combat-basics", "Combat Basics", "Desarma con una azada el escudo "
+         "que bloquea el golpe; el escudo sale como ItemDisplay con física, "
+         "rotación, rebote y recogida."),
+    ]
+    plugins = []
+    plugin_destino = destino / "plugins"
+    plugin_destino.mkdir(parents=True, exist_ok=True)
+    for plugin_id, nombre, descripcion in definiciones:
+        plugin_dir = BASE_DIR / "plugins-src" / plugin_id
+        try:
+            compilacion = subprocess.run(
+                [mvn, "-q", "-f", str(plugin_dir / "pom.xml"), "clean", "package"],
+                cwd=str(BASE_DIR), capture_output=True, text=True, timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Página: no se pudo compilar {nombre}: {exc}") from exc
+        if compilacion.returncode != 0:
+            detalle = (compilacion.stderr or compilacion.stdout).strip()[-1200:]
+            raise RuntimeError(f"Página: falló la compilación de {nombre}:\n{detalle}")
+        nombre_jar = "Permadeath.jar" if plugin_id == "permadeath" else "CombatBasics.jar"
+        jar = plugin_dir / "target" / nombre_jar
+        if not jar.is_file():
+            raise RuntimeError(f"Página: Maven terminó, pero no generó {nombre_jar}.")
+        jar_bytes = jar.read_bytes()
+        (plugin_destino / nombre_jar).write_bytes(jar_bytes)
+        plugins.append({
+            "id": plugin_id,
+            "nombre": nombre,
             "version": "1.0.0",
-            "descripcion": (
-                "Muerte temporal en espectador, recuperación de inventario "
-                "en cofres y avisos en Discord."
-            ),
-            "archivo": "Permadeath.jar",
+            "descripcion": descripcion,
+            "archivo": nombre_jar,
             "sha256": hashlib.sha256(jar_bytes).hexdigest(),
             "tamano": len(jar_bytes),
-        }],
-    }
+        })
+    manifest_plugins = {"version": version, "plugins": plugins}
     (destino / "plugins" / "manifest.json").write_text(
         json.dumps(manifest_plugins, ensure_ascii=False, indent=2) + "\n")
 

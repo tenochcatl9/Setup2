@@ -29,7 +29,10 @@ python3 setup_mc.py
 - **Túnel público**: Asyx con Pinggy de respaldo; barra de progreso y avisos a
   Discord, incluida la dirección final.
 - **Respaldos**: comprime el mundo y la instalación (con `setup_mc.py` dentro)
-  y los sube a Git; respaldos automáticos mientras el servidor corre.
+  y los sube a Git; respaldos automáticos mientras el servidor corre. Cuando
+  `.git` llega a 600 MB, publica el mundo en una release rodante que reemplaza
+  el asset anterior y evita añadir nuevos respaldos al historial. Esto frena
+  el crecimiento futuro; no reescribe los objetos que Git ya guardó.
 - **Panel (opcional)**: auto-actualización del propio script, estado en vivo y
   publicación de versiones.
 - **Página pública (opcional)**: guía y descarga del script en Cloudflare

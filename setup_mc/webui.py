@@ -46,7 +46,7 @@ PUERTO_UI_POR_DEFECTO = 8080
 TEMA_POR_DEFECTO = "template_default"
 MAX_PLUGIN_BYTES = 100 * 1024 * 1024
 RE_PLUGIN_NOMBRE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,123}\.jar$")
-CATALOGO_PLUGIN_IDS = {"permadeath"}
+CATALOGO_PLUGIN_IDS = {"permadeath", "combat-basics"}
 
 _lanzado = {"ts": 0.0}          # cuándo se pidió arrancar el servidor (anti doble clic)
 _candado_respaldo = threading.Lock()

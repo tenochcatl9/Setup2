@@ -735,6 +735,29 @@ function abrirPlugins(abrir) {
   }
 }
 
+async function instalarPluginCatalogo(boton) {
+  const aviso = $("aviso-plugins");
+  const plugin = boton.dataset.plugin;
+  boton.disabled = true;
+  aviso.textContent = `descargando y verificando ${plugin}…`;
+  try {
+    const respuesta = await fetch("/api/plugins/instalar", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plugin }),
+      cache: "no-store",
+    });
+    const datos = await respuesta.json();
+    if (!respuesta.ok) throw new Error(datos.error || `error ${respuesta.status}`);
+    aviso.textContent = `✓ ${datos.nombre} instalado y verificado; se cargará al próximo arranque`;
+    await refrescarPlugins();
+  } catch (error) {
+    aviso.textContent = `✗ no se pudo instalar ${plugin}: ${error.message}`;
+  } finally {
+    boton.disabled = false;
+  }
+}
+
 async function cargarPlugins(archivos) {
   const aviso = $("aviso-plugins");
   for (const archivo of archivos) {
@@ -768,6 +791,9 @@ async function cargarPlugins(archivos) {
 
 $("btn-plugins").addEventListener("click", () => abrirPlugins($("sidebar-plugins").hidden));
 $("btn-cerrar-plugins").addEventListener("click", () => abrirPlugins(false));
+document.querySelectorAll(".btn-instalar-catalogo").forEach((boton) => {
+  boton.addEventListener("click", () => instalarPluginCatalogo(boton));
+});
 $("btn-elegir-plugins").addEventListener("click", () => $("archivos-plugins").click());
 $("archivos-plugins").addEventListener("change", (evento) => {
   cargarPlugins(Array.from(evento.target.files));
@@ -791,6 +817,7 @@ document.addEventListener("keydown", (evento) => {
 });
 
 cargarTemas();
+if (new URLSearchParams(location.search).get("plugins") === "1") abrirPlugins(true);
 refrescarEstado().then(() => {
   if (modo !== "publico") {           // la consola solo corre en localhost
     refrescarConsola();

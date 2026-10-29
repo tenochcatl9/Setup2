@@ -38,6 +38,8 @@
 .plugin-contenido ul { margin: 12px 0 18px; padding-left: 20px; }
 .plugin-contenido li { margin: 4px 0; }
 .instalar-plugin:disabled { opacity: .55; cursor: wait; }
+.acciones-plugin { display: flex; flex-wrap: wrap; gap: 10px; }
+.descargar-plugin { display: inline-flex; align-items: center; text-decoration: none; }
 @media (max-width: 600px) {
   .plugin-card { grid-template-columns: 1fr; }
 }
