@@ -15,11 +15,13 @@ todo esto es no-op y el script se comporta como siempre.
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 import requests
@@ -205,11 +207,19 @@ def construir_sitio(destino: Path, version: str, changelog: str = "") -> dict:
         if not jar.is_file():
             raise RuntimeError(f"Página: Maven terminó, pero no generó {nombre_jar}.")
         jar_bytes = jar.read_bytes()
+        try:
+            with zipfile.ZipFile(jar) as paquete_jar:
+                descriptor = paquete_jar.read("plugin.yml").decode("utf-8")
+        except (OSError, KeyError, UnicodeDecodeError, zipfile.BadZipFile) as exc:
+            raise RuntimeError(f"Página: no se pudo leer plugin.yml de {nombre_jar}: {exc}") from exc
+        encontrado = re.search(r"(?m)^version:\s*['\"]?([^'\"\s]+)", descriptor)
+        if not encontrado:
+            raise RuntimeError(f"Página: falta la versión en plugin.yml de {nombre_jar}.")
         (plugin_destino / nombre_jar).write_bytes(jar_bytes)
         plugins.append({
             "id": plugin_id,
             "nombre": nombre,
-            "version": "1.1.0",
+            "version": encontrado.group(1),
             "descripcion": descripcion,
             "archivo": nombre_jar,
             "sha256": hashlib.sha256(jar_bytes).hexdigest(),

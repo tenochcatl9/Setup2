@@ -4,30 +4,33 @@ import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Particle;
+import org.bukkit.Sound;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
+import org.bukkit.block.data.type.Leaves;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
-import org.bukkit.enchantments.Enchantment;
-import org.bukkit.entity.Display;
 import org.bukkit.entity.AbstractArrow;
+import org.bukkit.entity.Display;
+import org.bukkit.entity.FallingBlock;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.ItemDisplay;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.SmallFireball;
-import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.PrepareAnvilEvent;
-import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.LootGenerateEvent;
-import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.meta.EnchantmentStorageMeta;
@@ -43,8 +46,8 @@ import net.kyori.adventure.text.format.TextDecoration;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
-import java.util.HashSet;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -57,6 +60,9 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
     private NamespacedKey hellRuneKey;
     private NamespacedKey hellBookKey;
     private NamespacedKey hellArrowKey;
+    private NamespacedKey hellFireballKey;
+    private NamespacedKey cutRuneKey;
+    private NamespacedKey cutBookKey;
     private NamespacedKey vxKey;
     private NamespacedKey vyKey;
     private NamespacedKey vzKey;
@@ -64,6 +70,7 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
     private NamespacedKey pitchKey;
     private NamespacedKey rollKey;
     private NamespacedKey pickupAtKey;
+    private boolean applyingSweep;
 
     @Override
     public void onEnable() {
@@ -72,6 +79,9 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
         hellRuneKey = new NamespacedKey(this, "hell-rune");
         hellBookKey = new NamespacedKey(this, "hell-rune-book");
         hellArrowKey = new NamespacedKey(this, "hell-rune-arrow");
+        hellFireballKey = new NamespacedKey(this, "hell-rune-fireball");
+        cutRuneKey = new NamespacedKey(this, "cut-rune");
+        cutBookKey = new NamespacedKey(this, "cut-rune-book");
         vxKey = new NamespacedKey(this, "velocity-x");
         vyKey = new NamespacedKey(this, "velocity-y");
         vzKey = new NamespacedKey(this, "velocity-z");
@@ -103,8 +113,9 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
         }
         if (args.length != 2 && args.length != 3
                 || !args[0].equalsIgnoreCase("give")
-                || args.length == 3 && !args[2].equalsIgnoreCase("hell")) {
-            sender.sendMessage("§eUsa: /combat give <jugador> [hell]");
+                || args.length == 3
+                && !args[2].equalsIgnoreCase("hell") && !args[2].equalsIgnoreCase("cut")) {
+            sender.sendMessage("§eUsa: /combat give <jugador> [hell|cut]");
             return true;
         }
         Player target = Bukkit.getPlayerExact(args[1]);
@@ -112,12 +123,14 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
             sender.sendMessage("§cEse jugador no está conectado.");
             return true;
         }
-        ItemStack book = createHellBook();
+        boolean cut = args.length == 3 && args[2].equalsIgnoreCase("cut");
+        ItemStack book = cut ? createCutBook() : createHellBook();
         Map<Integer, ItemStack> remaining = target.getInventory().addItem(book);
         for (ItemStack item : remaining.values()) {
             target.getWorld().dropItemNaturally(target.getLocation(), item);
         }
-        sender.sendMessage("§aLibro de la runa Hell entregado a " + target.getName() + ".");
+        sender.sendMessage("§aLibro de la runa " + (cut ? "Cut" : "Hell")
+                + " entregado a " + target.getName() + ".");
         return true;
     }
 
@@ -129,7 +142,7 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
             return matching(Bukkit.getOnlinePlayers().stream().map(Player::getName).toList(), args[1]);
         }
         if (args.length == 3 && args[0].equalsIgnoreCase("give")) {
-            return matching(List.of("hell"), args[2]);
+            return matching(List.of("hell", "cut"), args[2]);
         }
         return List.of();
     }
@@ -159,11 +172,40 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
         return book;
     }
 
+    private ItemStack createCutBook() {
+        ItemStack book = new ItemStack(Material.ENCHANTED_BOOK);
+        EnchantmentStorageMeta meta = (EnchantmentStorageMeta) book.getItemMeta();
+        meta.displayName(Component.text("Cut", NamedTextColor.LIGHT_PURPLE)
+                .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false));
+        meta.lore(List.of(
+                Component.text("RUNA DE HACHA", NamedTextColor.DARK_GRAY)
+                        .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false),
+                Component.text("Cut", NamedTextColor.LIGHT_PURPLE)
+                        .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false),
+                Component.text("Aplícala a un hacha en un yunque.", NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false),
+                Component.text("Agáchate y espera a que cargue el ataque.", NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false),
+                Component.text("Derriba árboles enteros con gravedad.", NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false)));
+        meta.setEnchantmentGlintOverride(true);
+        meta.getPersistentDataContainer().set(cutBookKey, PersistentDataType.BYTE, (byte) 1);
+        book.setItemMeta(meta);
+        return book;
+    }
+
     private boolean isHellBook(ItemStack item) {
         return item != null && item.getType() == Material.ENCHANTED_BOOK
                 && item.getItemMeta() != null
                 && item.getItemMeta().getPersistentDataContainer()
                 .has(hellBookKey, PersistentDataType.BYTE);
+    }
+
+    private boolean isCutBook(ItemStack item) {
+        return item != null && item.getType() == Material.ENCHANTED_BOOK
+                && item.getItemMeta() != null
+                && item.getItemMeta().getPersistentDataContainer()
+                .has(cutBookKey, PersistentDataType.BYTE);
     }
 
     private boolean hasHellRune(ItemStack item) {
@@ -172,22 +214,34 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
                 .has(hellRuneKey, PersistentDataType.BYTE);
     }
 
+    private boolean hasCutRune(ItemStack item) {
+        return item != null && isAxe(item.getType()) && item.getItemMeta() != null
+                && item.getItemMeta().getPersistentDataContainer()
+                .has(cutRuneKey, PersistentDataType.BYTE);
+    }
+
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPrepareAnvil(PrepareAnvilEvent event) {
-        ItemStack bow = event.getInventory().getItem(0);
+        ItemStack target = event.getInventory().getItem(0);
         ItemStack book = event.getInventory().getItem(1);
-        if (!isHellBook(book)) {
+        boolean hell = isHellBook(book);
+        boolean cut = isCutBook(book);
+        if (!hell && !cut) {
             return;
         }
-        if (bow == null || bow.getType() != Material.BOW || hasHellRune(bow)) {
+        if (target == null
+                || hell && (target.getType() != Material.BOW || hasHellRune(target))
+                || cut && (!isAxe(target.getType()) || hasCutRune(target))) {
             event.setResult(null);
             return;
         }
-        ItemStack result = bow.clone();
+        ItemStack result = target.clone();
         ItemMeta meta = result.getItemMeta();
-        meta.getPersistentDataContainer().set(hellRuneKey, PersistentDataType.BYTE, (byte) 1);
+        String rune = hell ? "Hell" : "Cut";
+        meta.getPersistentDataContainer().set(
+                hell ? hellRuneKey : cutRuneKey, PersistentDataType.BYTE, (byte) 1);
         List<Component> lore = new ArrayList<>(meta.lore() == null ? List.of() : meta.lore());
-        lore.add(Component.text("Hell", NamedTextColor.LIGHT_PURPLE)
+        lore.add(Component.text(rune, NamedTextColor.LIGHT_PURPLE)
                 .decorate(TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false));
         meta.lore(lore);
         result.setItemMeta(meta);
@@ -197,17 +251,22 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onAnvilTake(InventoryClickEvent event) {
-        if (event.getRawSlot() != 2 || !isHellBook(event.getView().getItem(1))) {
+        if (event.getRawSlot() != 2) {
             return;
         }
-        if (event.getView().getItem(0) == null
-                || event.getView().getItem(0).getType() != Material.BOW
-                || !hasHellRune(event.getCurrentItem())) {
+        ItemStack book = event.getView().getItem(1);
+        boolean hell = isHellBook(book);
+        boolean cut = isCutBook(book);
+        if ((!hell && !cut) || event.getView().getItem(0) == null
+                || hell && (event.getView().getItem(0).getType() != Material.BOW
+                || !hasHellRune(event.getCurrentItem()))
+                || cut && (!isAxe(event.getView().getItem(0).getType())
+                || !hasCutRune(event.getCurrentItem()))) {
             event.setCancelled(true);
         }
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onHellBowShoot(EntityShootBowEvent event) {
         if (!(event.getProjectile() instanceof AbstractArrow arrow) || !hasHellRune(event.getBow())) {
             return;
@@ -215,7 +274,7 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
         arrow.getPersistentDataContainer().set(hellArrowKey, PersistentDataType.BYTE, (byte) 1);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onHellArrowHit(ProjectileHitEvent event) {
         if (!(event.getEntity() instanceof AbstractArrow arrow)
                 || !arrow.getPersistentDataContainer().has(hellArrowKey, PersistentDataType.BYTE)
@@ -223,10 +282,10 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
                 || victim.isDead()) {
             return;
         }
-        Player shooter = arrow.getShooter() instanceof Player player ? player : null;
+        var shooter = arrow.getShooter();
         int count = Math.max(1, Math.min(24, getConfig().getInt("hell-fireball-count", 10)));
         double radius = Math.max(1.0, Math.min(8.0,
-                getConfig().getDouble("hell-spiral-radius", 3.5)));
+                getConfig().getDouble("hell-spiral-radius", 4.5)));
         long interval = Math.max(1L, getConfig().getLong("hell-fireball-interval-ticks", 2L));
         for (int index = 0; index < count; index++) {
             int step = index;
@@ -240,8 +299,12 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
                 Location launch = center.clone().add(
                         Math.cos(angle) * radius, height, Math.sin(angle) * radius);
                 Vector direction = center.toVector().subtract(launch.toVector()).normalize();
-                SmallFireball fireball = victim.getWorld().spawn(launch, SmallFireball.class, entity -> {
-                    entity.setShooter(shooter);
+                victim.getWorld().spawn(launch, SmallFireball.class, entity -> {
+                    if (shooter != null) {
+                        entity.setShooter(shooter);
+                    }
+                    entity.getPersistentDataContainer().set(
+                            hellFireballKey, PersistentDataType.BYTE, (byte) 1);
                     entity.setDirection(direction);
                     entity.setIsIncendiary(false);
                     entity.setYield(0.0f);
@@ -253,9 +316,169 @@ public final class CombatBasicsPlugin extends JavaPlugin implements Listener {
         arrow.remove();
     }
 
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onHellFireballHit(ProjectileHitEvent event) {
+        if (event.getEntity() instanceof SmallFireball fireball
+                && fireball.getPersistentDataContainer()
+                .has(hellFireballKey, PersistentDataType.BYTE)) {
+            fireball.getWorld().playSound(
+                    fireball.getLocation(), Sound.ENTITY_FIREWORK_ROCKET_BLAST, 1.0f, 0.0f);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onCutSweep(EntityDamageByEntityEvent event) {
+        if (applyingSweep || !(event.getDamager() instanceof Player attacker)
+                || !(event.getEntity() instanceof LivingEntity primary)
+                || !hasCutRune(attacker.getInventory().getItemInMainHand())
+                || !isCutReady(attacker)) {
+            return;
+        }
+        double radius = Math.max(0.5, Math.min(3.0,
+                getConfig().getDouble("cut-sweep-radius", 1.0)));
+        double damage = Math.max(1.0, getConfig().getDouble("cut-sweep-damage", 1.0));
+        Vector facing = attacker.getLocation().getDirection().setY(0);
+        if (facing.lengthSquared() < 0.0001) {
+            return;
+        }
+        facing.normalize();
+        applyingSweep = true;
+        try {
+            for (var entity : attacker.getWorld().getNearbyEntities(
+                    attacker.getLocation(), radius, 0.75, radius)) {
+                if (!(entity instanceof LivingEntity target)
+                        || target.equals(attacker) || target.equals(primary) || target.isDead()) {
+                    continue;
+                }
+                Vector toTarget = target.getLocation().toVector()
+                        .subtract(attacker.getLocation().toVector()).setY(0);
+                if (toTarget.lengthSquared() == 0 || facing.dot(toTarget.normalize()) <= 0) {
+                    continue;
+                }
+                target.damage(damage, attacker);
+                target.getWorld().spawnParticle(
+                        Particle.SWEEP_ATTACK, target.getLocation().add(0, 1, 0),
+                        1, 0.1, 0.1, 0.1, 0.0);
+            }
+        } finally {
+            applyingSweep = false;
+        }
+        attacker.getWorld().playSound(
+                attacker.getLocation(), Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1.0f, 1.0f);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onCutTree(BlockBreakEvent event) {
+        Player player = event.getPlayer();
+        ItemStack axe = player.getInventory().getItemInMainHand();
+        if (!hasCutRune(axe) || !isCutReady(player) || !isTreeLog(event.getBlock().getType())) {
+            return;
+        }
+        List<Block> tree = findTreeBlocks(event.getBlock());
+        if (tree.isEmpty()) {
+            return;
+        }
+        event.setCancelled(true);
+        event.setDropItems(false);
+        Vector fallDirection = player.getLocation().getDirection().setY(0);
+        if (fallDirection.lengthSquared() == 0) {
+            fallDirection = new Vector(0, 0, 1);
+        }
+        fallDirection.normalize();
+        int lowestY = tree.stream().mapToInt(Block::getY).min().orElse(event.getBlock().getY());
+        List<FallingTreeBlock> falling = tree.stream()
+                .map(block -> new FallingTreeBlock(
+                        block.getLocation().add(0.5, 0.0, 0.5), block.getBlockData().clone(),
+                        isTreeLog(block.getType())))
+                .toList();
+        for (Block block : tree) {
+            block.setType(Material.AIR, false);
+        }
+        for (FallingTreeBlock part : falling) {
+            double heightFactor = Math.max(0.0, part.location().getY() - lowestY) * 0.018;
+            FallingBlock entity = part.location().getWorld().spawnFallingBlock(
+                    part.location(), part.data());
+            entity.setDropItem(part.log());
+            entity.setHurtEntities(false);
+            entity.setVelocity(fallDirection.clone().multiply(0.16 + heightFactor)
+                    .setY(0.12 + Math.min(heightFactor, 0.3)));
+        }
+        player.getWorld().playSound(event.getBlock().getLocation(),
+                event.getBlock().getBlockData().getSoundGroup().getBreakSound(), 1.0f, 0.65f);
+    }
+
+    private boolean isCutReady(Player player) {
+        return player.isSneaking() && player.isOnGround() && !player.isSprinting()
+                && player.getAttackCooldown() >= 0.9f;
+    }
+
+    private boolean isAxe(Material material) {
+        return material.name().endsWith("_AXE");
+    }
+
+    private boolean isTreeLog(Material material) {
+        return material.name().endsWith("_LOG") || material.name().endsWith("_STEM");
+    }
+
+    private List<Block> findTreeBlocks(Block origin) {
+        int maxLogs = getConfig().getInt("cut-tree-max-logs", 256);
+        int maxLeaves = getConfig().getInt("cut-tree-max-leaves", 512);
+        if (maxLogs < 1 || maxLeaves < 0) {
+            return List.of();
+        }
+        List<Block> logs = new ArrayList<>();
+        Set<Long> seen = new HashSet<>();
+        List<Block> pending = new ArrayList<>();
+        pending.add(origin);
+        seen.add(origin.getBlockKey());
+        BlockFace[] neighbors = {
+                BlockFace.UP, BlockFace.DOWN, BlockFace.NORTH,
+                BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST
+        };
+        for (int cursor = 0; cursor < pending.size(); cursor++) {
+            Block current = pending.get(cursor);
+            logs.add(current);
+            if (logs.size() > maxLogs) {
+                return List.of();
+            }
+            for (BlockFace face : neighbors) {
+                Block adjacent = current.getRelative(face);
+                if (isTreeLog(adjacent.getType()) && seen.add(adjacent.getBlockKey())) {
+                    pending.add(adjacent);
+                }
+            }
+        }
+
+        List<Block> tree = new ArrayList<>(logs);
+        Set<Long> leavesSeen = new HashSet<>();
+        for (Block log : logs) {
+            for (int dx = -3; dx <= 3; dx++) {
+                for (int dy = -3; dy <= 3; dy++) {
+                    for (int dz = -3; dz <= 3; dz++) {
+                        Block candidate = log.getRelative(dx, dy, dz);
+                        if (!(candidate.getBlockData() instanceof Leaves leaves)
+                                || leaves.isPersistent() || !leavesSeen.add(candidate.getBlockKey())) {
+                            continue;
+                        }
+                        tree.add(candidate);
+                        if (tree.size() - logs.size() > maxLeaves) {
+                            return List.of();
+                        }
+                    }
+                }
+            }
+        }
+        return tree;
+    }
+
+    private record FallingTreeBlock(Location location, org.bukkit.block.data.BlockData data, boolean log) {}
+
     @EventHandler(priority = EventPriority.HIGH)
     public void onStructureLoot(LootGenerateEvent event) {
         if (!getConfig().getBoolean("hell-books-in-structures", true)) {
+            return;
+        }
+        if (event.getLootTable() == null) {
             return;
         }
         String path = event.getLootTable().getKey().getKey();
