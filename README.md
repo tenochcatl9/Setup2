@@ -27,9 +27,9 @@ python3 setup_mc.py
   (registro/login adaptado a túnel) y SkinsRestorer. La lista puede venir del
   panel sin tocar el código. Permadeath y Combat Basics verifican su catálogo
   HTTPS y SHA-256 antes de cada arranque; si hay una versión nueva, la descargan
-  antes de iniciar Paper y la cargan en ese arranque. Combat Basics añade Hell:
-  una runa de arco que aparece en cofres de estructuras, se aplica con yunque
-  y lanza bolas de fuego en espiral cuando la flecha impacta.
+  antes de iniciar Paper y la cargan en ese arranque. Combat Basics añade Hell
+  (runa de arco con bolas de fuego en espiral) y Cut (runa de hacha con
+  barridos y derribo de árboles al agacharse y cargar el ataque).
 - **Túnel público**: Asyx con Pinggy de respaldo; barra de progreso y avisos a
   Discord, incluida la dirección final.
 - **Respaldos**: comprime el mundo y la instalación (con `setup_mc.py` dentro)

@@ -8,5 +8,9 @@ hell-books-in-structures: true
 hell-book-structure-chance: 0.12
 hell-fireball-count: 10
 hell-fireball-interval-ticks: 2
-hell-spiral-radius: 3.5
+hell-spiral-radius: 4.5
 hell-fireball-speed: 0.75
+cut-sweep-radius: 1.0
+cut-sweep-damage: 1.0
+cut-tree-max-logs: 256
+cut-tree-max-leaves: 512

@@ -1,5 +1,15 @@
 name: CombatBasics
-version: 1.0.0
+version: 1.3.0
 main: dev.tenohost.combatbasics.CombatBasicsPlugin
 api-version: '26.3'
-description: Desarma escudos bloqueados con ataques de azada y los expulsa con física.
+description: Desarma escudos con azadas y añade las runas Hell para arcos y Cut para hachas.
+commands:
+  combatbasics:
+    description: Entrega libros de las runas Hell y Cut.
+    aliases: [combat]
+    usage: /combat give <jugador> [hell|cut]
+    permission: combatbasics.give
+permissions:
+  combatbasics.give:
+    description: Permite entregar libros de runas.
+    default: op
